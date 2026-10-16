@@ -560,7 +560,21 @@ impl Inner {
     fn shown_bitmap(&self, pts_ms: i64, target_w: u32) -> Option<std::sync::Arc<SubtitleBitmap>> {
         if self.ass.is_some() {
             let show = self.ass_show(pts_ms)?;
-            return self.ready_for_ass(&show.key).cloned();
+            if let Some(b) = self.ready_for_ass(&show.key) {
+                return Some(Arc::clone(b));
+            }
+            // Not baked yet: the worker is behind on an animation tick, or
+            // an event started / ended mid-tick (the prefetch only covers
+            // the next tick boundary). Keep the latest frame from just
+            // before instead of drawing nothing — every subtitle on screen,
+            // static dialogue included, used to blink off for that frame.
+            return self
+                .ready
+                .iter()
+                .filter(|b| b.ass_key.is_some())
+                .filter(|b| (0..=ASS_HOLD_MS).contains(&(pts_ms - b.ass_time_ms)))
+                .max_by_key(|b| b.ass_time_ms)
+                .cloned();
         }
         let (text, layout) = self.shown_at(pts_ms)?;
         self.ready_for(&text, &layout, target_w).cloned()
@@ -761,6 +775,8 @@ pub struct SubtitleBitmap {
     target_w: u32,
     /// ASS frames: which events at which animation tick.
     ass_key: Option<AssKey>,
+    /// ASS frames: the time the frame was rendered at (0 for text cues).
+    ass_time_ms: i64,
 }
 
 /// What an ASS frame shows: the active events (indices into the script)
@@ -780,6 +796,11 @@ struct AssShow {
 
 /// Animated ASS events are re-rendered at this interval (~30 Hz).
 const ASS_TICK_MS: i64 = 33;
+
+/// How old a finished ASS frame may be and still stand in for the one the
+/// worker hasn't baked yet (see `Inner::shown_bitmap`). Bounded so a seek
+/// never shows a frame from somewhere else.
+const ASS_HOLD_MS: i64 = 1000;
 
 /// The ASS track the cues belong to.
 struct AssTrack {
@@ -1574,7 +1595,10 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
     let rasterized = match baked {
         Baked::Text(r) => r,
         Baked::Ass(c) => {
-            let key = job.ass.map(|a| a.show.key);
+            let (key, time_ms) = match job.ass {
+                Some(a) => (Some(a.show.key), a.show.time_ms),
+                None => (None, 0),
+            };
             let (width, height, rgba, origin) = match c {
                 Some(c) => (c.width, c.height, c.rgba, Some((c.left as f32, c.top as f32))),
                 None => (0, 0, Vec::new(), None),
@@ -1590,6 +1614,7 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
                 text: String::new(),
                 target_w: job.target_w,
                 ass_key: key,
+                ass_time_ms: time_ms,
             };
         }
     };
@@ -1608,6 +1633,7 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
         text: job.text,
         target_w: job.target_w,
         ass_key: None,
+        ass_time_ms: 0,
     }
 }
 
@@ -1628,7 +1654,7 @@ mod tests {
 
     /// Build an `Inner` the way `queue_cues` would, so `max_cue_span_ms`
     /// stays consistent with the cue list.
-    fn inner_with(cues: Vec<VttCue>) -> Inner {
+    pub(super) fn inner_with(cues: Vec<VttCue>) -> Inner {
         let mut sorted = cues;
         sorted.sort_by_key(|c| c.start_ms);
         let max_cue_span_ms = sorted
@@ -1769,6 +1795,7 @@ mod tests {
             text: "first".to_string(),
             target_w: 1920,
             ass_key: None,
+            ass_time_ms: 0,
         }));
         // Within 5%: keep the rasterization, a dragged window resizes by
         // a pixel at a time and re-baking each step is pure churn.
@@ -1947,6 +1974,7 @@ mod tests {
             text: String::new(),
             target_w: 0,
             ass_key: None,
+            ass_time_ms: 0,
         }
     }
 
@@ -2335,6 +2363,49 @@ mod gpu_tests {
         assert_eq!(n, 200 * 200);
         let white = &px[((150 * W + 300) * 4) as usize..][..3];
         assert_eq!(white, &[255, 255, 255]);
+    }
+
+    #[test]
+    fn ass_holds_the_last_frame_until_the_new_one_is_baked() {
+        // An animated sign (fades in) under a line of static dialogue that
+        // starts mid-tick.
+        let mut inner = super::tests::inner_with(ass_cues(
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(500,0)}Sign\n\
+             Dialogue: 0,0:00:01.01,0:00:03.00,Default,,0,0,0,,Dialogue\n",
+        ));
+        let script = inner.cues.iter().find_map(|c| c.ass.as_ref().map(|a| Arc::clone(&a.script))).unwrap();
+        let animated = script.events.iter().map(event_animates).collect();
+        inner.ass = Some(AssTrack { script, animated });
+        let baked = |inner: &mut Inner, pts: i64| {
+            let show = inner.ass_show(pts).unwrap();
+            inner.ready.push(Arc::new(SubtitleBitmap {
+                rgba: vec![0; 4],
+                width: 1,
+                height: 1,
+                generation: show.time_ms as u64,
+                line_height_px: 0,
+                layout: CueLayout::DEFAULT,
+                origin: Some((0.0, 0.0)),
+                text: String::new(),
+                target_w: 1920,
+                ass_key: Some(show.key),
+                ass_time_ms: show.time_ms,
+            }));
+        };
+        baked(&mut inner, 990);
+        // 1015 ms: same tick as 990, but the dialogue has started — a key
+        // nobody prefetched. The sign frame from 990 stays up meanwhile.
+        let held = inner.shown_bitmap(1015, 1920).expect("held frame");
+        assert_eq!(held.ass_time_ms, 990 - 990 % ASS_TICK_MS);
+        // Once baked, the exact frame wins.
+        baked(&mut inner, 1015);
+        let shown = inner.shown_bitmap(1015, 1920).unwrap();
+        assert!(shown.ass_key.as_ref().unwrap().events.len() == 2);
+        // Never a frame from the future (a backward seek) or from long ago.
+        assert!(inner.shown_bitmap(500, 1920).is_none());
+        assert!(inner.shown_bitmap(2990, 1920).is_none());
+        // Nothing active: nothing drawn, held frames or not.
+        assert!(inner.shown_bitmap(6000, 1920).is_none());
     }
 
     #[test]

@@ -3,6 +3,20 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.20
+
+### All platforms
+
+- **ASS subtitles no longer blink.** The overlay drew nothing for a frame
+  whose ASS bitmap the worker hadn't finished — every animation tick it
+  fell behind on, and every event that started or ended mid-tick (the
+  prefetch only covers the next tick boundary). Because one bitmap holds
+  everything on screen, static dialogue under an animated sign blinked
+  with it. Until the wanted frame is baked, the latest finished frame from
+  the last second stays up (only while events are active, never one from
+  after the playhead), the way async libass renderers keep their last
+  canvas.
+
 ## 0.2.19
 
 ### All platforms
