@@ -1,0 +1,6 @@
+# script  frame times (ms) — one line per script in this directory.
+# The golden test (player/src/renderers/subtitle/ass/golden.rs) and
+# scripts/ass_golden.sh both read this list.
+features 500 1500 2500 3500 4500 5500 6400 7500
+fansub 400 1600 3000 6000 9500 12100 13500
+bidi 500

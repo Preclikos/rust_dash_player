@@ -1,0 +1,16 @@
+[Script Info]
+; Golden test script: bidirectional text and the VSFilter per-run reordering.
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,30,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Hello שלום (world) 123!
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\an8}مرحبا بالعالم 2024 test
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,{\an5}אבג {\c&H0000FF&}דהו{\c} זחט

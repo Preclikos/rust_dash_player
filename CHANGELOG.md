@@ -3,6 +3,36 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.19
+
+### All platforms
+
+- **ASS/SSA subtitles, styled.** A libass-compatible renderer in pure Rust
+  (harfrust shaping, skrifa outlines, zeno rasterization; builds for every
+  target including wasm): styles, `\pos`/`\move`/`\org`, 3D rotation and
+  shear, `\clip`/`\iclip` with rectangles or drawings, `\p` drawings,
+  borders, shadows, `\blur`/`\be`, opaque boxes, `\fad`/`\t` animation,
+  karaoke, collision stacking, `WrapStyle` 0–3, right-to-left text,
+  vertical `@Font` text, the script's `[Fonts]`. Golden tests against libass
+  frames (`player/tests/ass_golden`, `scripts/ass_golden.sh`). See
+  `PLAYER_INTEGRATION.md` §9.
+- ASS tracks from a manifest: a text AdaptationSet with `codecs="ass"` /
+  `mimeType="text/x-ssa"` and a single file; fonts listed with DVB font
+  download descriptors (`urn:dvb:dash:fontdownload:2014`, any number per
+  track) are fetched before the track's first frame.
+- Sidecar `.ass`/`.ssa` files through `add_external_subtitle_track`
+  (`SubtitleFormat::Ass`, detected from the header, charset detected).
+- `Player::add_subtitle_font(bytes)`: fonts for ASS scripts from the host
+  (TTF/OTF/TTC).
+- `VttCue::ass` links a cue to its ASS event (`player::ass`); its `text` /
+  `layout` are a plain rendering for sinks that draw text only.
+
+### Desktop
+
+- Test shell: drop a subtitle or font file on the window; `subfile
+  <path>` takes paths with spaces; `subfonts <dir>`;
+  `RUST_PLAYER_SUB_FONTS=<dir>`.
+
 ## 0.2.18
 
 ### All platforms

@@ -1,7 +1,7 @@
 //! Host-supplied sidecar subtitles: bytes in, cues out.
 //!
 //! Backs [`crate::Player::add_external_subtitle_track`]. The desktop flow
-//! is "user picks a .srt/.vtt next to the movie" — the host owns the file
+//! is "user picks a .srt/.vtt/.ass next to the movie" — the host owns the file
 //! picker, we only ever see the bytes — so everything about the payload is
 //! unknown up front and has to be sniffed:
 //!
@@ -12,13 +12,19 @@
 //!     valid legacy text) and fall back to `chardetng`, which is
 //!     Firefox's detector — so we land on the same encoding the browser
 //!     a user compares us against would.
-//!   * **Format.** WebVTT announces itself with a `WEBVTT` magic; SubRip
-//!     has no header at all, so it's identified by shape (a `-->` timing
-//!     line near the top).
+//!   * **Format.** WebVTT announces itself with a `WEBVTT` magic, ASS/SSA
+//!     with a `[Script Info]` (or styles) section header; SubRip has no
+//!     header at all, so it's identified by shape (a `-->` timing line
+//!     near the top).
 //!
-//! Parsing itself is shared with the streaming path: both formats reduce
-//! to `vtt::parse_cue_blocks`.
+//! Parsing itself is shared with the streaming path: WebVTT and SubRip
+//! reduce to `vtt::parse_cue_blocks`, ASS to `ass::parse` +
+//! `ass::plain::to_cues` (single-file `.ass` tracks from a manifest come
+//! through here too, for the charset handling).
 
+use std::sync::Arc;
+
+use crate::parsers::ass::{self, AssScript};
 use crate::parsers::vtt::{self, VttCue};
 
 /// Source format of a host-supplied subtitle file.
@@ -32,6 +38,8 @@ pub enum SubtitleFormat {
     WebVtt,
     /// SubRip (`.srt`).
     SubRip,
+    /// Advanced SubStation Alpha (`.ass`) or SubStation Alpha v4 (`.ssa`).
+    Ass,
 }
 
 /// Why a sidecar file could not be turned into a subtitle track.
@@ -39,9 +47,9 @@ pub enum SubtitleFormat {
 pub enum SidecarError {
     /// Zero bytes handed in.
     Empty,
-    /// The bytes decoded fine but contained no `-->` timing line, so this
-    /// is not a subtitle file we understand — an .ass/.sub/.idx, or the
-    /// wrong file entirely.
+    /// The bytes decoded fine but are none of the formats we read (no
+    /// `WEBVTT`, no `-->` timing line, no ASS section) — a .sub/.idx, or
+    /// the wrong file entirely.
     NotSubtitleText,
     /// Recognisably a subtitle file, but every cue block failed to parse.
     /// Almost always malformed or truncated timings.
@@ -55,7 +63,7 @@ impl std::fmt::Display for SidecarError {
         match self {
             SidecarError::Empty => write!(f, "subtitle file is empty"),
             SidecarError::NotSubtitleText => {
-                write!(f, "not a WebVTT or SubRip file (no '-->' timing line found)")
+                write!(f, "not a WebVTT, SubRip or ASS/SSA file")
             }
             SidecarError::NoCues => write!(f, "no cues could be parsed from the file"),
             SidecarError::UnknownEncoding(label) => {
@@ -78,6 +86,10 @@ pub struct ParsedSidecar {
     /// ("UTF-8", "windows-1250", …). Hosts show this so a user looking at
     /// mangled diacritics knows which encoding to force.
     pub encoding: &'static str,
+    /// The parsed script when the file is ASS/SSA (every cue links into it
+    /// too). Hosts read the styles' font names and the embedded fonts from
+    /// it to know which fonts the track wants.
+    pub script: Option<Arc<AssScript>>,
 }
 
 /// Decode, sniff and parse a sidecar subtitle file.
@@ -103,6 +115,10 @@ pub fn parse(
         SubtitleFormat::Auto => sniff(&body).ok_or(SidecarError::NotSubtitleText)?,
         explicit => explicit,
     };
+
+    if detected == SubtitleFormat::Ass {
+        return parse_ass(&body, encoding_used, time_offset_ms);
+    }
 
     let mut cues = vtt::parse_cue_blocks(&body);
     if cues.is_empty() {
@@ -130,6 +146,31 @@ pub fn parse(
         cues,
         format: detected,
         encoding: encoding_used,
+        script: None,
+    })
+}
+
+fn parse_ass(body: &str, encoding: &'static str, time_offset_ms: i64) -> Result<ParsedSidecar, SidecarError> {
+    let mut script = ass::parse(body).ok_or(SidecarError::NotSubtitleText)?;
+    // Shift the events themselves, not just the cues: an ASS renderer
+    // times `\t`, `\fad` and `\move` from the event's own start.
+    if time_offset_ms != 0 {
+        for e in &mut script.events {
+            let end = (e.end_ms() + time_offset_ms).max(0);
+            e.start_ms = (e.start_ms + time_offset_ms).max(0);
+            e.duration_ms = end - e.start_ms;
+        }
+    }
+    let script = Arc::new(script);
+    let cues = ass::plain::to_cues(&script);
+    if cues.is_empty() {
+        return Err(SidecarError::NoCues);
+    }
+    Ok(ParsedSidecar {
+        cues,
+        format: SubtitleFormat::Ass,
+        encoding,
+        script: Some(script),
     })
 }
 
@@ -174,12 +215,15 @@ fn decode(bytes: &[u8], forced: Option<&str>) -> Result<(String, &'static str), 
 fn sniff(body: &str) -> Option<SubtitleFormat> {
     // The magic may sit behind a BOM, and some tools prepend blank lines.
     let head: String = body.chars().take(64).collect();
-    if head
-        .trim_start_matches('\u{FEFF}')
-        .trim_start()
-        .starts_with("WEBVTT")
-    {
+    let head = head.trim_start_matches('\u{FEFF}').trim_start();
+    if head.starts_with("WEBVTT") {
         return Some(SubtitleFormat::WebVtt);
+    }
+    // ASS/SSA open with a section header: `[Script Info]` normally, a bare
+    // styles section is something libass accepts too.
+    let starts_ci = |h: &str| head.len() >= h.len() && head.as_bytes()[..h.len()].eq_ignore_ascii_case(h.as_bytes());
+    if ["[Script Info]", "[V4+ Styles]", "[V4 Styles]"].into_iter().any(starts_ci) {
+        return Some(SubtitleFormat::Ass);
     }
     // No header in SubRip, so look for a timing line. Bounded scan, so a
     // large non-subtitle file is rejected without walking all of it.
@@ -276,6 +320,41 @@ mod tests {
             parse(b"just some notes about the movie\n", SubtitleFormat::Auto, None, 0).unwrap_err(),
             SidecarError::NotSubtitleText
         );
+    }
+
+    const ASS: &str = "\u{feff}[Script Info]\r\nScriptType: v4.00+\r\nPlayResX: 640\r\nPlayResY: 360\r\n\r\n\
+        [V4+ Styles]\r\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\r\n\
+        Style: Default,Arial,26,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1.3,0,2,20,20,23,1\r\n\r\n\
+        [Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n\
+        Dialogue: 0,0:00:05.00,0:00:07.00,Default,,0,0,0,,Druhý{\\i1} řádek\r\n\
+        Dialogue: 0,0:00:01.00,0:00:04.00,Default,,0,0,0,,{\\fad(200,0)}První řádek\r\n";
+
+    #[test]
+    fn parses_ass_into_start_ordered_linked_cues() {
+        let p = parse(ASS.as_bytes(), SubtitleFormat::Auto, None, 0).unwrap();
+        assert_eq!(p.format, SubtitleFormat::Ass);
+        assert_eq!(p.cues.len(), 2);
+        assert_eq!(p.cues[0].text, "První řádek");
+        assert_eq!(p.cues[1].text, "Druhý řádek");
+        let script = p.script.unwrap();
+        assert_eq!(p.cues[0].ass.as_ref().unwrap().event, 1);
+        assert!(Arc::ptr_eq(&p.cues[0].ass.as_ref().unwrap().script, &script));
+    }
+
+    #[test]
+    fn ass_offset_moves_the_events_too() {
+        let p = parse(ASS.as_bytes(), SubtitleFormat::Auto, None, -2000).unwrap();
+        assert_eq!((p.cues[0].start_ms, p.cues[0].end_ms), (0, 2000));
+        let e = p.cues[0].ass.as_ref().unwrap().event();
+        assert_eq!((e.start_ms, e.end_ms()), (0, 2000));
+    }
+
+    #[test]
+    fn legacy_encoded_ass_is_detected() {
+        let (bytes, _, _) = encoding_rs::WINDOWS_1250.encode(&ASS[3..]);
+        let p = parse(&bytes, SubtitleFormat::Auto, None, 0).unwrap();
+        assert_eq!(p.format, SubtitleFormat::Ass);
+        assert_eq!(p.cues[1].text, "Druhý řádek");
     }
 
     #[test]

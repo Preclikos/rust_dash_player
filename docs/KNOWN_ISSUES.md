@@ -162,3 +162,27 @@ These are not bugs in the player, but breaking them reproduces old bugs.
 - **Where:** `decoders/videotoolbox.rs`.
 - **Next:** a visual check on macOS and an iPhone across several switches,
   including SDR ↔ 10-bit PQ.
+
+## ASS subtitles: what differs from libass or is not verified
+
+- **Not on devices yet.** The renderer and the overlay path are covered by
+  unit, GPU and golden tests on Windows; Android, Apple and web have only
+  been built, not watched. Expect the first look on a TV SoC to be about the
+  worker's render time for heavy animated typesetting (~2 ms per 1080p frame
+  on a desktop CPU, release build).
+- **`@Font` vertical alternates.** libass enables `vert`/`vkna` for `@Font`
+  runs and so does the renderer, but the ffmpeg/libass build used for the
+  golden references did not substitute the vertical form of `、` in MS Gothic
+  where harfrust does. Not part of the golden set.
+- **`YCbCr Matrix` is not applied.** Scripts tagged `TV.601` on BT.709 video
+  are drawn with the colours as written (as ffmpeg's filter does; mpv
+  corrects them).
+- **ASS in ISO BMFF segments** (no standard carriage) and **MKV embedded
+  tracks** are not read; MKV font attachments have to come through
+  `Player::add_subtitle_font`.
+- **Colliding events after a backward seek** are placed afresh; libass keeps
+  the earlier placement for events it has already shown, so a stack can
+  come out in a different order than before the seek.
+
+Where: `player/src/renderers/subtitle/ass/`, golden data in
+`player/tests/ass_golden/`.

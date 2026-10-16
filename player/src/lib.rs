@@ -79,6 +79,11 @@ pub use renderers::video_offscreen::OffscreenTarget;
 pub use renderers::{audio::AudioRenderer, video::VideoRenderer, AudioPassthrough, AudioSink, VideoSink};
 pub use decoders::DecodedVideoFrame;
 pub use parsers::vtt::VttCue;
+/// ASS/SSA scripts: what [`VttCue::ass`] links to, and what
+/// [`Player::add_external_subtitle_track`] parses `.ass` files into.
+pub use parsers::ass;
+/// A font a manifest text track asks for (DVB font download descriptor).
+pub use manifest::FontDownload;
 
 /// Types defined by the player module itself, re-exported so the public
 /// surface is unchanged by where they live.

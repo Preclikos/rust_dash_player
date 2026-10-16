@@ -38,11 +38,14 @@ use std::sync::{Arc, Mutex};
 
 use wgpu::util::DeviceExt;
 
+use crate::parsers::ass::{AssScript, Item, Tag};
 use crate::parsers::vtt::{Anchor, CueLayout, CueLine, VttCue};
 use crate::{SubtitleAnchor, SubtitleStyle};
 
 // CPU cue rasterization (fontdue) lives in its own file (mirrors `video`).
 mod rasterizer;
+// ASS/SSA rendering (libass port).
+pub(crate) mod ass;
 
 // ---------------------------------------------------------------------------
 // Geometry — a port of media3 `SubtitleView` / `SubtitlePainter` defaults so
@@ -97,6 +100,12 @@ pub struct CueParent {
     /// letterbox bar and climbed back into the picture, which is the one
     /// thing placing it in the bar was meant to avoid.
     picture_h: f32,
+    /// The aspect-fitted picture itself, whatever the anchor and inset:
+    /// ASS events are laid out on it (libass's frame is the video).
+    picture_left: f32,
+    picture_top: f32,
+    picture_w: f32,
+    picture_full_h: f32,
 }
 
 impl CueParent {
@@ -113,6 +122,7 @@ impl CueParent {
         let tw = target_w as f32;
         let th = target_h as f32;
         let picture_scale_y = scale_y;
+        let picture_scale_x = scale_x;
         let (scale_x, scale_y) = match anchor {
             SubtitleAnchor::Screen => (1.0, 1.0),
             SubtitleAnchor::Picture => (scale_x, scale_y),
@@ -121,6 +131,7 @@ impl CueParent {
         // The picture's own height, taken before the anchor may have flattened
         // the scale to 1.0 — see `picture_h`.
         let picture_h = (th * sane(picture_scale_y)).round();
+        let picture_w = (tw * sane(picture_scale_x)).round();
         let pw = (tw * sane(scale_x)).round();
         let ph = (th * sane(scale_y)).round();
         let left = ((tw - pw) / 2.0).floor();
@@ -140,6 +151,10 @@ impl CueParent {
             // box itself (media3 resolves text size against
             // `viewHeightMinusPadding`).
             picture_h: (picture_h - inset).max(1.0),
+            picture_left: ((tw - picture_w) / 2.0).floor(),
+            picture_top: ((th - picture_h) / 2.0).floor(),
+            picture_w: picture_w.max(1.0),
+            picture_full_h: picture_h.max(1.0),
         }
     }
 
@@ -180,6 +195,11 @@ impl CueParent {
     /// [`CueParent::picture_h`].
     pub fn type_height(&self) -> u32 {
         self.picture_h.round().max(1.0) as u32
+    }
+
+    /// Size of the aspect-fitted picture (the ASS frame).
+    pub fn picture_size(&self) -> (u32, u32) {
+        (self.picture_w as u32, self.picture_full_h as u32)
     }
 }
 
@@ -250,7 +270,11 @@ pub fn place_cue(
 /// The quad both draw paths share: `[center_x, center_y, half_w, half_h]`
 /// in NDC (y up) for `bitmap` placed by [`place_cue`] on `parent`'s target.
 pub fn cue_quad(bitmap: &SubtitleBitmap, parent: &CueParent) -> [f32; 4] {
-    let (x, y) = place_cue(bitmap.width, bitmap.height, bitmap.line_height_px, &bitmap.layout, parent);
+    let (x, y) = match bitmap.origin {
+        // An ASS frame: already laid out, positioned on the picture.
+        Some((ox, oy)) => (parent.picture_left + ox, parent.picture_top + oy),
+        None => place_cue(bitmap.width, bitmap.height, bitmap.line_height_px, &bitmap.layout, parent),
+    };
     let tw = parent.target_w as f32;
     let th = parent.target_h as f32;
     let bw = bitmap.width as f32;
@@ -459,9 +483,103 @@ struct Inner {
     /// there. Only ever grows while cues are pushed (a stale-large value
     /// just widens the window, never hides a cue); reset by `clear`.
     max_cue_span_ms: i64,
+    /// Set when the cues are ASS events: they are then drawn as whole
+    /// frames by `ass_renderer` instead of as text.
+    ass: Option<AssTrack>,
+    /// Shared with the worker; holds the fonts (built-in, host-added) and
+    /// the collision placement state across frames.
+    ass_renderer: Arc<Mutex<ass::AssRenderer>>,
+    /// The aspect-fitted picture the render path last drew on (the ASS
+    /// frame size).
+    picture_w: u32,
+    picture_h: u32,
+    /// The playhead jumped back: colliding events get placed afresh.
+    ass_relayout: bool,
+    /// Decoded video size (libass storage size); 0×0 = unknown.
+    video_w: u32,
+    video_h: u32,
 }
 
 impl Inner {
+    /// ASS mode: the events active at `pts_ms`, file indices in cue order.
+    fn ass_active(&self, pts_ms: i64) -> Vec<usize> {
+        let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
+        let lo = self.cues.partition_point(|c| c.start_ms <= pts_ms - self.max_cue_span_ms);
+        let mut ev: Vec<usize> = self.cues[lo..hi]
+            .iter()
+            .filter(|c| c.is_active(pts_ms))
+            .filter_map(|c| c.ass.as_ref().map(|a| a.event))
+            .collect();
+        ev.sort_unstable();
+        ev
+    }
+
+    /// ASS mode: what is shown at `pts_ms`.
+    fn ass_show(&self, pts_ms: i64) -> Option<AssShow> {
+        let track = self.ass.as_ref()?;
+        let events = self.ass_active(pts_ms);
+        if events.is_empty() {
+            return None;
+        }
+        let animated = events.iter().any(|&e| track.animated.get(e).copied().unwrap_or(false));
+        let (tick, time_ms) = if animated {
+            let tick = pts_ms.div_euclid(ASS_TICK_MS);
+            (tick, tick * ASS_TICK_MS)
+        } else {
+            (-1, pts_ms)
+        };
+        Some(AssShow { key: AssKey { events, tick }, time_ms })
+    }
+
+    /// ASS mode: the frame shown now and the one to prefetch — the next
+    /// tick while something animates, else the frame at the next moment
+    /// an event starts or ends.
+    fn ass_wanted(&self, pts_ms: i64) -> [Option<AssShow>; 2] {
+        let now = self.ass_show(pts_ms);
+        let next_t = match &now {
+            Some(s) if s.key.tick >= 0 => Some((s.key.tick + 1) * ASS_TICK_MS),
+            _ => {
+                let next_start = self.cues.get(self.cues.partition_point(|c| c.start_ms <= pts_ms)).map(|c| c.start_ms);
+                let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
+                let lo = self.cues.partition_point(|c| c.start_ms <= pts_ms - self.max_cue_span_ms);
+                let next_end = self.cues[lo..hi].iter().filter(|c| c.is_active(pts_ms)).map(|c| c.end_ms).min();
+                match (next_start, next_end) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+        };
+        [now, next_t.and_then(|t| self.ass_show(t))]
+    }
+
+    fn ready_for_ass(&self, key: &AssKey) -> Option<&std::sync::Arc<SubtitleBitmap>> {
+        self.ready.iter().find(|b| b.ass_key.as_ref() == Some(key))
+    }
+
+    /// The finished bitmap for what is on screen at `pts_ms`, either kind.
+    fn shown_bitmap(&self, pts_ms: i64, target_w: u32) -> Option<std::sync::Arc<SubtitleBitmap>> {
+        if self.ass.is_some() {
+            let show = self.ass_show(pts_ms)?;
+            return self.ready_for_ass(&show.key).cloned();
+        }
+        let (text, layout) = self.shown_at(pts_ms)?;
+        self.ready_for(&text, &layout, target_w).cloned()
+    }
+
+    /// Record the picture size; true when it changed (ASS frames are laid
+    /// out at it, so finished ones go stale).
+    fn note_picture(&mut self, w: u32, h: u32) -> bool {
+        if (self.picture_w, self.picture_h) == (w, h) {
+            return false;
+        }
+        self.picture_w = w;
+        self.picture_h = h;
+        if self.ass.is_some() {
+            self.invalidate();
+        }
+        true
+    }
+
     /// Index of the cue active at `pts_ms`, or `None`.
     ///
     /// Same answer as `cues.iter().find(|c| c.is_active(pts))` — the first
@@ -511,11 +629,17 @@ impl Inner {
     /// cue as one block in start order with the first one's layout. Every
     /// renderer draws a single bitmap; this used to show the first active
     /// cue only and drop the rest.
+    ///
+    /// Cues without text (ASS drawings, tag-only events) take no part: they
+    /// would add a blank line, or leave nothing to show yet win the layout.
     fn shown_at(&self, pts_ms: i64) -> Option<(std::borrow::Cow<'_, str>, CueLayout)> {
         let first = self.active_index(pts_ms)?;
         let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
-        let cue = &self.cues[first];
-        let mut rest = self.cues[first + 1..hi].iter().filter(|c| c.is_active(pts_ms)).peekable();
+        let mut active = self.cues[first..hi]
+            .iter()
+            .filter(|c| c.is_active(pts_ms) && !c.text.is_empty());
+        let cue = active.next()?;
+        let mut rest = active.peekable();
         if rest.peek().is_none() {
             return Some((std::borrow::Cow::Borrowed(cue.text.as_str()), cue.layout));
         }
@@ -549,7 +673,9 @@ impl Inner {
                 }
             }
         }
-        WantedKey { first, last, active, next }
+        // ASS: an animated frame changes every tick, not only at cue edges.
+        let tick = if self.ass.is_some() { self.ass_show(pts_ms).map_or(-1, |s| s.key.tick) } else { -1 };
+        WantedKey { first, last, active, next, tick }
     }
 
     /// Finished bitmap for `text` at roughly `target_w`, if the worker has
@@ -598,6 +724,8 @@ struct WantedKey {
     last: Option<usize>,
     active: usize,
     next: Option<usize>,
+    /// ASS animation tick, -1 when nothing animates.
+    tick: i64,
 }
 
 /// Rasterized-at width close enough to the drawn width to reuse. Mirrors
@@ -624,10 +752,53 @@ pub struct SubtitleBitmap {
     pub line_height_px: u32,
     /// The cue's placement settings — `cue_quad` positions by them.
     pub layout: CueLayout,
+    /// Set for an ASS frame: the bitmap's top-left corner on the picture
+    /// (px), which `cue_quad` uses instead of `layout`.
+    pub origin: Option<(f32, f32)>,
     /// Identity for cache validation: same text + same settings at about
     /// the same parent width = same bitmap.
     text: String,
     target_w: u32,
+    /// ASS frames: which events at which animation tick.
+    ass_key: Option<AssKey>,
+}
+
+/// What an ASS frame shows: the active events (indices into the script)
+/// and, while any of them animates, the animation tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AssKey {
+    events: Vec<usize>,
+    tick: i64,
+}
+
+/// An ASS frame to render: its key and the time to render it at.
+#[derive(Clone, Debug)]
+struct AssShow {
+    key: AssKey,
+    time_ms: i64,
+}
+
+/// Animated ASS events are re-rendered at this interval (~30 Hz).
+const ASS_TICK_MS: i64 = 33;
+
+/// The ASS track the cues belong to.
+struct AssTrack {
+    script: Arc<AssScript>,
+    /// Per event: does its look change while it is on screen (`\t`,
+    /// `\fad`, `\move`, karaoke, a scrolling effect)?
+    animated: Vec<bool>,
+}
+
+fn event_animates(e: &crate::parsers::ass::AssEvent) -> bool {
+    fn tags(t: &[Tag]) -> bool {
+        t.iter().any(|t| {
+            matches!(
+                t,
+                Tag::Transform { .. } | Tag::Fade { .. } | Tag::Move { .. } | Tag::Karaoke { .. } | Tag::KaraokeStart(_)
+            )
+        })
+    }
+    !e.effect.is_empty() || e.items.iter().any(|i| matches!(i, Item::Override(t) if tags(t)))
 }
 
 impl SubtitleOverlay {
@@ -711,6 +882,13 @@ impl SubtitleOverlay {
                 wanted: WantedKey::default(),
                 shutdown: false,
                 max_cue_span_ms: 0,
+                ass: None,
+                ass_renderer: Arc::new(Mutex::new(ass::AssRenderer::new())),
+                picture_w: 0,
+                picture_h: 0,
+                ass_relayout: false,
+                video_w: 0,
+                video_h: 0,
             }),
             wake: std::sync::Condvar::new(),
         });
@@ -781,6 +959,39 @@ impl SubtitleOverlay {
         Ok(())
     }
 
+    /// Add a font for ASS rendering (see `AssRenderer::add_font`). The
+    /// frames on screen are re-rendered with it.
+    pub fn add_ass_font(&self, bytes: Vec<u8>) -> usize {
+        let renderer = Arc::clone(&self.shared.inner.lock().unwrap().ass_renderer);
+        let n = renderer.lock().unwrap().add_font(bytes);
+        if n > 0 {
+            self.with_inner_notify(|inner| {
+                if inner.ass.is_some() {
+                    inner.invalidate();
+                }
+            });
+        }
+        n
+    }
+
+    /// The decoded video's size (ASS blur, unscaled borders and perspective
+    /// are measured in video pixels, as in libass hosts).
+    pub fn set_video_size(&self, w: u32, h: u32) {
+        let changed = {
+            let mut inner = self.shared.inner.lock().unwrap();
+            let changed = (inner.video_w, inner.video_h) != (w, h);
+            inner.video_w = w;
+            inner.video_h = h;
+            if changed && inner.ass.is_some() {
+                inner.invalidate();
+            }
+            changed
+        };
+        if changed {
+            self.shared.wake.notify_one();
+        }
+    }
+
     /// The layout-box anchor of the current style — the draw paths build
     /// their `CueParent` with it.
     pub fn anchor(&self) -> SubtitleAnchor {
@@ -801,6 +1012,22 @@ impl SubtitleOverlay {
     /// segment; raw single-file delivery sends the whole list once.
     pub fn queue_cues(&self, cues: Vec<VttCue>) {
         self.with_inner_notify(|inner| {
+            let script = cues.iter().find_map(|c| c.ass.as_ref().map(|a| Arc::clone(&a.script)));
+            if let Some(script) = script {
+                let same = inner.ass.as_ref().is_some_and(|t| Arc::ptr_eq(&t.script, &script));
+                if !same {
+                    let animated = script.events.iter().map(event_animates).collect();
+                    log::info!(
+                        "[subs] ASS track: {} events, {}x{}",
+                        script.events.len(),
+                        script.play_res_x,
+                        script.play_res_y
+                    );
+                    inner.ass = Some(AssTrack { script, animated });
+                    inner.ass_relayout = true;
+                    inner.invalidate();
+                }
+            }
             for c in cues {
                 inner.max_cue_span_ms = inner.max_cue_span_ms.max(c.end_ms - c.start_ms);
                 inner.cues.push(c);
@@ -825,6 +1052,7 @@ impl SubtitleOverlay {
         self.with_inner_notify(|inner| {
             inner.cues.clear();
             inner.max_cue_span_ms = 0;
+            inner.ass = None;
             inner.invalidate();
             inner.wanted = WantedKey::default();
         });
@@ -842,15 +1070,14 @@ impl SubtitleOverlay {
     pub fn active_bitmap(&self, parent: &CueParent) -> Option<std::sync::Arc<SubtitleBitmap>> {
         let (target_w, target_h) = (parent.width(), parent.height());
         let type_h = parent.type_height();
+        let (pic_w, pic_h) = parent.picture_size();
         let (bitmap, resized) = {
             let mut inner = self.shared.inner.lock().unwrap();
-            let resized = inner.note_target(target_w, target_h, type_h);
+            let resized = inner.note_target(target_w, target_h, type_h) | inner.note_picture(pic_w, pic_h);
             let pts = inner.current_pts_ms;
             // Borrows the cue text for the lookup (a single active cue, the
             // normal case, allocates nothing).
-            let bitmap = inner
-                .shown_at(pts)
-                .and_then(|(text, layout)| inner.ready_for(&text, &layout, target_w).cloned());
+            let bitmap = inner.shown_bitmap(pts, target_w);
             (bitmap, resized)
         };
         if resized {
@@ -875,6 +1102,10 @@ impl SubtitleOverlay {
     pub fn set_pts_ms(&self, pts_ms: i64) {
         let wake = {
             let mut inner = self.shared.inner.lock().unwrap();
+            // A jump back (seek): ASS events collide afresh.
+            if inner.ass.is_some() && pts_ms + 1000 < inner.current_pts_ms {
+                inner.ass_relayout = true;
+            }
             inner.current_pts_ms = pts_ms;
             // Called once per frame, so this must stay cheap: two binary
             // searches, and a notify only when the playhead actually moved
@@ -913,16 +1144,16 @@ impl SubtitleOverlay {
         // bake the wanted cue right here. Cue changes are rare (seconds
         // apart) and one rasterization is a few ms, so paying it on the
         // render path beats having no subtitles at all.
+        let (pic_w, pic_h) = parent.picture_size();
         if self.worker.is_none() {
+            self.shared.inner.lock().unwrap().note_picture(pic_w, pic_h);
             self.rasterize_inline(target_w, target_h, type_h);
         }
         let (bitmap, resized) = {
             let mut inner = self.shared.inner.lock().unwrap();
-            let resized = inner.note_target(target_w, target_h, type_h);
+            let resized = inner.note_target(target_w, target_h, type_h) | inner.note_picture(pic_w, pic_h);
             let pts = inner.current_pts_ms;
-            let bitmap = inner
-                .shown_at(pts)
-                .and_then(|(text, layout)| inner.ready_for(&text, &layout, target_w).cloned());
+            let bitmap = inner.shown_bitmap(pts, target_w);
             (bitmap, resized)
         };
         if resized {
@@ -1117,12 +1348,14 @@ impl SubtitleOverlay {
         let job = {
             let mut inner = self.shared.inner.lock().unwrap();
             inner.note_target(target_w, target_h, type_h);
-            next_job(&inner)
+            let job = next_job(&inner);
+            if job.as_ref().is_some_and(|j| j.ass.is_some()) {
+                inner.ass_relayout = false;
+            }
+            job
         };
         let Some(job) = job else { return };
-        let rasterized = rasterizer::rasterize_cue(
-            &job.fonts, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
-        );
+        let rasterized = bake(&job);
         let mut inner = self.shared.inner.lock().unwrap();
         if inner.epoch != job.epoch {
             return;
@@ -1177,7 +1410,12 @@ fn raster_worker(shared: Arc<Shared>) {
                     return;
                 }
                 match next_job(&inner) {
-                    Some(job) => break job,
+                    Some(job) => {
+                        if job.ass.is_some() {
+                            inner.ass_relayout = false;
+                        }
+                        break job;
+                    }
                     // Everything wanted is ready. Park until it isn't.
                     None => inner = shared.wake.wait(inner).unwrap(),
                 }
@@ -1185,9 +1423,7 @@ fn raster_worker(shared: Arc<Shared>) {
         };
 
         // Lock released: this is the multi-millisecond part.
-        let rasterized = rasterizer::rasterize_cue(
-            &job.fonts, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
-        );
+        let rasterized = bake(&job);
 
         let mut inner = shared.inner.lock().unwrap();
         if inner.shutdown {
@@ -1226,12 +1462,84 @@ struct RasterJob {
     type_h: u32,
     /// `Inner::epoch` when the job was cut.
     epoch: u64,
+    /// An ASS frame instead of a text cue.
+    ass: Option<AssJob>,
+}
+
+/// One ASS frame to render.
+struct AssJob {
+    script: Arc<AssScript>,
+    show: AssShow,
+    renderer: Arc<Mutex<ass::AssRenderer>>,
+    frame: ass::Frame,
+    /// Forget earlier collision placements first (after a seek).
+    relayout: bool,
+}
+
+/// A job's output.
+enum Baked {
+    Text(Option<rasterizer::CueRaster>),
+    Ass(Option<ass::Composite>),
+}
+
+/// Do the expensive part of a job (no lock held).
+fn bake(job: &RasterJob) -> Baked {
+    match &job.ass {
+        None => Baked::Text(rasterizer::rasterize_cue(
+            &job.fonts, &job.text, &job.layout, job.target_w, job.type_h, &job.style,
+        )),
+        Some(a) => {
+            let mut r = a.renderer.lock().unwrap();
+            if a.relayout {
+                r.reset_layout();
+            }
+            let started = crate::rt::Instant::now();
+            let imgs = r.render(&a.script, &a.show.key.events, a.show.time_ms, a.frame);
+            let out = ass::composite(&imgs, a.frame.width, a.frame.height);
+            log::trace!(
+                "[subs/ass] {} events -> {} images in {:?}",
+                a.show.key.events.len(),
+                imgs.len(),
+                started.elapsed()
+            );
+            Baked::Ass(out)
+        }
+    }
 }
 
 /// The next cue that needs rasterizing, or `None` when everything wanted
 /// is already in `ready`. Split out of the worker so the borrow of
 /// `inner` ends before the guard is re-assigned in the wait loop.
 fn next_job(inner: &Inner) -> Option<RasterJob> {
+    if let Some(track) = &inner.ass {
+        if inner.picture_w == 0 || inner.picture_h == 0 {
+            return None;
+        }
+        let font = inner.font.as_ref()?;
+        for show in inner.ass_wanted(inner.current_pts_ms).into_iter().flatten() {
+            if inner.ready_for_ass(&show.key).is_none() {
+                let storage = (inner.video_w > 0).then_some((inner.video_w, inner.video_h));
+                let frame = ass::frame_for(&track.script, inner.picture_w, inner.picture_h, storage, inner.style.size_scale as f64);
+                return Some(RasterJob {
+                    fonts: rasterizer::FontSet { primary: Arc::clone(font), fallback: inner.fallback.clone() },
+                    text: String::new(),
+                    layout: CueLayout::DEFAULT,
+                    style: inner.style,
+                    target_w: inner.picture_w,
+                    type_h: inner.type_h,
+                    epoch: inner.epoch,
+                    ass: Some(AssJob {
+                        script: Arc::clone(&track.script),
+                        show,
+                        renderer: Arc::clone(&inner.ass_renderer),
+                        frame,
+                        relayout: inner.ass_relayout,
+                    }),
+                });
+            }
+        }
+        return None;
+    }
     let font = inner.font.as_ref()?;
     // Before the first draw we don't know the surface size, so there is
     // nothing sensible to rasterize at yet.
@@ -1251,6 +1559,7 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
                 target_w: inner.target_w,
                 type_h: inner.type_h,
                 epoch: inner.epoch,
+                ass: None,
             });
         }
     }
@@ -1261,7 +1570,29 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
 /// cue laid out to nothing) becomes a zero-size bitmap so the job counts
 /// as done and the worker doesn't spin on it; both draw paths skip
 /// zero-size entries.
-fn finished_bitmap(job: RasterJob, rasterized: Option<rasterizer::CueRaster>, generation: u64) -> SubtitleBitmap {
+fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBitmap {
+    let rasterized = match baked {
+        Baked::Text(r) => r,
+        Baked::Ass(c) => {
+            let key = job.ass.map(|a| a.show.key);
+            let (width, height, rgba, origin) = match c {
+                Some(c) => (c.width, c.height, c.rgba, Some((c.left as f32, c.top as f32))),
+                None => (0, 0, Vec::new(), None),
+            };
+            return SubtitleBitmap {
+                rgba,
+                width,
+                height,
+                generation,
+                line_height_px: 0,
+                layout: CueLayout::DEFAULT,
+                origin,
+                text: String::new(),
+                target_w: job.target_w,
+                ass_key: key,
+            };
+        }
+    };
     let (width, height, rgba, line_height_px) = match rasterized {
         Some(r) => (r.width, r.height, r.rgba, r.line_height_px),
         None => (0, 0, Vec::new(), 0),
@@ -1273,8 +1604,10 @@ fn finished_bitmap(job: RasterJob, rasterized: Option<rasterizer::CueRaster>, ge
         generation,
         line_height_px,
         layout: job.layout,
+        origin: None,
         text: job.text,
         target_w: job.target_w,
+        ass_key: None,
     }
 }
 
@@ -1289,6 +1622,7 @@ mod tests {
             text: text.to_string(),
             settings: String::new(),
             layout: CueLayout::DEFAULT,
+            ass: None,
         }
     }
 
@@ -1317,6 +1651,13 @@ mod tests {
             wanted: WantedKey::default(),
             shutdown: false,
             max_cue_span_ms,
+            ass: None,
+            ass_renderer: Arc::new(Mutex::new(ass::AssRenderer::new())),
+            picture_w: 1920,
+            picture_h: 1080,
+            ass_relayout: false,
+            video_w: 0,
+            video_h: 0,
         }
     }
 
@@ -1424,8 +1765,10 @@ mod tests {
             generation: 1,
             line_height_px: 1,
             layout: CueLayout::DEFAULT,
+            origin: None,
             text: "first".to_string(),
             target_w: 1920,
+            ass_key: None,
         }));
         // Within 5%: keep the rasterization, a dragged window resizes by
         // a pixel at a time and re-baking each step is pure churn.
@@ -1600,8 +1943,10 @@ mod tests {
             generation: 1,
             line_height_px: lh,
             layout: CueLayout::parse(settings),
+            origin: None,
             text: String::new(),
             target_w: 0,
+            ass_key: None,
         }
     }
 
@@ -1871,6 +2216,7 @@ mod gpu_tests {
                 text: t.to_string(),
                 settings: String::new(),
                 layout: CueLayout::DEFAULT,
+                ass: None,
             })
             .collect();
         overlay.queue_cues(cues);
@@ -1885,6 +2231,7 @@ mod gpu_tests {
                 text: text.to_string(),
                 settings: String::new(),
                 layout: CueLayout::DEFAULT,
+                ass: None,
             }]);
             fresh.set_pts_ms(500);
             for _ in 0..400 {
@@ -1929,5 +2276,90 @@ mod gpu_tests {
         }
         let allocs = overlay.texture_allocs.load(Ordering::Relaxed);
         assert!(allocs <= 2, "{allocs} cue textures allocated for {} cues — expected reuse", texts.len());
+    }
+
+    fn ass_cues(events: &str) -> Vec<VttCue> {
+        let script = format!(
+            "[Script Info]\nScriptType: v4.00+\nPlayResX: 640\nPlayResY: 360\n\n[V4+ Styles]\n\
+             Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
+             Style: Default,Roboto,30,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,2,20,20,20,1\n\n\
+             [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n{events}"
+        );
+        crate::parsers::sidecar::parse(script.as_bytes(), crate::parsers::sidecar::SubtitleFormat::Ass, None, 0)
+            .unwrap()
+            .cues
+    }
+
+    fn wait_frame(dev: &wgpu::Device, queue: &wgpu::Queue, overlay: &SubtitleOverlay, target: &wgpu::Texture, ok: impl Fn(&[u8]) -> bool) -> Vec<u8> {
+        let mut last = Vec::new();
+        for _ in 0..400 {
+            last = frame(dev, queue, overlay, target);
+            if ok(&last) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        last
+    }
+
+    fn target(dev: &wgpu::Device) -> wgpu::Texture {
+        dev.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    }
+
+    #[test]
+    fn ass_frames_are_drawn_where_the_script_puts_them() {
+        let Some((dev, queue)) = device() else {
+            eprintln!("SKIP: no GPU adapter");
+            return;
+        };
+        let overlay = SubtitleOverlay::new(Arc::clone(&dev), Arc::clone(&queue), wgpu::TextureFormat::Rgba8Unorm);
+        let target = target(&dev);
+        // A 100x100 square at script (100, 50) on a 640x360 script is
+        // 200x200 px at (200, 100) on the 1280x720 picture.
+        overlay.queue_cues(ass_cues(
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an7\\pos(100,50)\\p1}m 0 0 l 100 0 100 100 0 100\n",
+        ));
+        overlay.set_pts_ms(1000);
+        let px = wait_frame(&dev, &queue, &overlay, &target, |p| changed(p).is_some());
+        let ((x0, y0, x1, y1), n) = changed(&px).expect("the ASS frame was drawn");
+        assert_eq!((x0, y0, x1, y1), (200, 100, 399, 299));
+        assert_eq!(n, 200 * 200);
+        let white = &px[((150 * W + 300) * 4) as usize..][..3];
+        assert_eq!(white, &[255, 255, 255]);
+    }
+
+    #[test]
+    fn animated_ass_frames_follow_the_playhead() {
+        let Some((dev, queue)) = device() else {
+            eprintln!("SKIP: no GPU adapter");
+            return;
+        };
+        let overlay = SubtitleOverlay::new(Arc::clone(&dev), Arc::clone(&queue), wgpu::TextureFormat::Rgba8Unorm);
+        let target = target(&dev);
+        // Black to white over the first second.
+        overlay.queue_cues(ass_cues(
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an7\\pos(0,0)\\c&H000000&\\t(0,1000,\\c&HFFFFFF&)\\p1}m 0 0 l 100 0 100 100 0 100\n",
+        ));
+        let at = |pts: i64| -> u8 {
+            overlay.set_pts_ms(pts);
+            // the tick a frame shows starts at most ASS_TICK_MS before pts
+            let want = ((pts - pts % ASS_TICK_MS) as f64 / 1000.0 * 255.0) as i32;
+            let px = wait_frame(&dev, &queue, &overlay, &target, |p| (p[((50 * W + 50) * 4) as usize] as i32 - want).abs() <= 2);
+            px[((50 * W + 50) * 4) as usize]
+        };
+        let a = at(100);
+        let b = at(500);
+        let c = at(2000);
+        assert!(a < b && b < c, "{a} {b} {c}");
+        assert_eq!(c, 255);
     }
 }

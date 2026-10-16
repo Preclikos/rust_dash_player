@@ -99,12 +99,19 @@ pub struct TextRepresenation {
     /// list, into the selection cell, into the spawned task) and the cue
     /// list is the one part of it that isn't cheap to copy.
     pub external_cues: Option<Arc<Vec<VttCue>>>,
+
+    /// Fonts the manifest lists for this track (DVB font download
+    /// descriptors on its AdaptationSet), URLs made absolute. Fetched when
+    /// the track is selected, before its cues are shown.
+    pub fonts: Vec<crate::manifest::FontDownload>,
 }
 
 impl TextRepresenation {
     pub fn codec_short(&self) -> &str {
         let c = self.codecs.as_str();
-        if c.starts_with("wvtt") || self.mime_type == "text/vtt" {
+        if self.is_ass() {
+            "ASS"
+        } else if c.starts_with("wvtt") || self.mime_type == "text/vtt" {
             "WebVTT"
         } else if c.starts_with("stpp") || c.starts_with("ttml") || self.mime_type.contains("ttml") {
             "TTML"
@@ -127,6 +134,20 @@ impl TextRepresenation {
     pub fn is_webvtt(&self) -> bool {
         let c = self.codecs.as_str();
         c.starts_with("wvtt") || self.mime_type == "text/vtt" || self.mime_type == "application/x-mpegurl"
+    }
+
+    /// True for ASS/SSA: `@codecs="ass"` (or `ssa`), or one of the mime
+    /// types `.ass` files go by (`text/x-ssa` is the registered-in-practice
+    /// one). Only single-file delivery is read — there is no standard
+    /// carriage of ASS in ISO BMFF segments.
+    pub fn is_ass(&self) -> bool {
+        let c = self.codecs.to_ascii_lowercase();
+        c == "ass"
+            || c == "ssa"
+            || matches!(
+                self.mime_type.to_ascii_lowercase().as_str(),
+                "text/x-ssa" | "text/x-ass" | "application/x-ssa" | "application/x-ass"
+            )
     }
 
     /// Single-line summary for a track picker, e.g. `"WebVTT · 12 kbps"`.

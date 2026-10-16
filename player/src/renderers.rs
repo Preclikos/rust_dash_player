@@ -39,6 +39,13 @@ pub trait VideoSink: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Add a font file (TTF/OTF/TTC) for styled (ASS) subtitles, on top of
+    /// the built-in faces. Returns how many faces were added (0 for a font
+    /// already known or invalid bytes). Default: ignored.
+    fn add_subtitle_font(&self, _bytes: Vec<u8>) -> usize {
+        0
+    }
+
     /// Apply subtitle styling (text/outline colour, size multiplier).
     /// Default no-op so sinks that don't render subtitles keep compiling.
     /// Sinks that own the overlay store it and invalidate any cached

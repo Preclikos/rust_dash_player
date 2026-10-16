@@ -16,17 +16,20 @@ pub(super) fn external_track(
     parsed: crate::parsers::sidecar::ParsedSidecar,
     options: &ExternalSubtitleOptions,
 ) -> (crate::tracks::text::TextRepresenation, crate::tracks::text::TextAdaptation) {
+    use crate::parsers::sidecar::SubtitleFormat;
     let mime_type = match parsed.format {
-        crate::parsers::sidecar::SubtitleFormat::SubRip => "application/x-subrip",
+        SubtitleFormat::SubRip => "application/x-subrip",
+        SubtitleFormat::Ass => "text/x-ssa",
         _ => "text/vtt",
     }
     .to_string();
 
     let representation = crate::tracks::text::TextRepresenation {
         id,
-        // `wvtt` regardless of the source format: by this point the cues
-        // are parsed and everything downstream only sees WebVTT cues.
-        codecs: "wvtt".to_string(),
+        // `wvtt` for SubRip too: by this point the cues are parsed and
+        // everything downstream only sees WebVTT cues. ASS keeps its own
+        // codec — its cues carry the styled event as well.
+        codecs: if parsed.format == SubtitleFormat::Ass { "ass" } else { "wvtt" }.to_string(),
         mime_type,
         bandwidth: 0,
         base_url: String::new(),
@@ -36,6 +39,7 @@ pub(super) fn external_track(
         segments: Vec::new(),
         single_file_url: None,
         external_cues: Some(Arc::new(parsed.cues)),
+        fonts: Vec::new(),
     };
 
     let mut roles = vec!["subtitle".to_string()];
@@ -102,6 +106,65 @@ pub(super) async fn text_play<V: VideoSink>(
             cues.len()
         );
         video_sink.queue_subtitle_cues(cues.as_ref().clone());
+        return Ok(());
+    }
+
+    // ---- ASS/SSA: one script file per track ----
+    if text_representation.is_ass() {
+        let Some(url) = &text_representation.single_file_url else {
+            log::info!(
+                "[subs] ASS representation {} is not a single file — only BaseURL delivery is supported",
+                text_representation.id
+            );
+            return Ok(());
+        };
+        log::info!("[subs] downloading ASS script: {}", url);
+        let bytes = match http.get(url.clone(), RequestKind::InitSegment).await {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("[subs] ASS download failed: {}", e);
+                return Ok(());
+            }
+        };
+        if stopped() || !still_selected(&active) {
+            return Ok(());
+        }
+        // Fonts the manifest lists for the track, before the first frame so
+        // it doesn't flash up in the fallback face.
+        for font in &text_representation.fonts {
+            match http.get(font.url.clone(), RequestKind::InitSegment).await {
+                Ok(bytes) => {
+                    let faces = video_sink.add_subtitle_font(bytes.to_vec());
+                    log::info!("[subs] font {} ({:?}): {} faces", font.url, font.family, faces);
+                }
+                Err(e) => {
+                    let level = if font.essential { log::Level::Warn } else { log::Level::Info };
+                    log::log!(level, "[subs] font {} not loaded: {}", font.url, e);
+                }
+            }
+            if stopped() || !still_selected(&active) {
+                return Ok(());
+            }
+        }
+        // Through the sidecar parser for its charset detection: `.ass`
+        // files are not reliably UTF-8 either.
+        match crate::parsers::sidecar::parse(&bytes, crate::parsers::sidecar::SubtitleFormat::Ass, None, 0) {
+            Ok(parsed) => {
+                if let Some(script) = &parsed.script {
+                    log::info!(
+                        "[subs] ASS script: {} events, {} styles, {}x{}, {} embedded fonts ({})",
+                        script.events.len(),
+                        script.styles.len() - 1,
+                        script.play_res_x,
+                        script.play_res_y,
+                        script.fonts.len(),
+                        parsed.encoding,
+                    );
+                }
+                video_sink.queue_subtitle_cues(parsed.cues);
+            }
+            Err(e) => log::warn!("[subs] ASS script from {} not usable: {}", url, e),
+        }
         return Ok(());
     }
 

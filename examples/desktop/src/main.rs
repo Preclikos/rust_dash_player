@@ -116,6 +116,19 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => {
                 player.resize(player::PhysicalSize::new(size.width, size.height));
             }
+            // Drop a subtitle file (.ass/.ssa/.srt/.vtt) on the window to
+            // load and show it, or a font (.ttf/.otf/.ttc) to use it for ASS.
+            WindowEvent::DroppedFile(path) => {
+                let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+                if matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => println!("font {}: {} faces", path.display(), player.add_subtitle_font(bytes)),
+                        Err(e) => println!("font {}: {e}", path.display()),
+                    }
+                } else {
+                    load_subtitle_file(player, &path, 0);
+                }
+            }
             WindowEvent::KeyboardInput {
                 device_id: _,
                 event,
@@ -294,6 +307,42 @@ mod platform {
     }
 }
 
+/// Load a sidecar subtitle file and select it.
+fn load_subtitle_file(player: &Player, path: &std::path::Path, offset_ms: i64) {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => return println!("subfile: {}: {e}", path.display()),
+    };
+    let label = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    match player.add_external_subtitle_track(
+        &bytes,
+        player::ExternalSubtitleOptions { time_offset_ms: offset_ms, label: label.clone(), ..Default::default() },
+    ) {
+        Ok(track) => {
+            println!("subfile: {} → {}", label.unwrap_or_default(), track.label());
+            player.set_subtitle_track(&track);
+        }
+        Err(e) => println!("subfile: {}: {e}", path.display()),
+    }
+}
+
+/// `<path> [offset_ms]`, the path optionally in double quotes and allowed
+/// to contain spaces; a trailing integer is the offset.
+fn parse_subfile_args(rest: &str) -> Option<(String, i64)> {
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let (path, after) = quoted.split_once('"')?;
+        let offset = after.trim().parse().unwrap_or(0);
+        return Some((path.to_string(), offset));
+    }
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.rsplit_once(' ') {
+        Some((path, last)) if last.parse::<i64>().is_ok() => Some((path.trim_end().to_string(), last.parse().unwrap())),
+        _ => Some((rest.to_string(), 0)),
+    }
+}
+
 async fn run_console(player: Player) {
     print_menu(&player);
     println!("Commands:");
@@ -305,7 +354,8 @@ async fn run_console(player: Player) {
     println!("  abr off  — disable ABR (Manual)");
     println!("  p        — pause / resume (also: space in the window)");
     println!("  spatial on|off — Windows 7.1 spatial-sound output (default on)");
-    println!("  subfile <path> [offset_ms] — load + show a sidecar .vtt/.srt");
+    println!("  subfile <path> [offset_ms] — load + show a sidecar .vtt/.srt/.ass (or drop it on the window)");
+    println!("  subfonts <dir> — add every font in a folder for ASS subtitles (or drop a font on the window)");
     println!("  seek <ms>      — absolute seek; seek +<ms> / -<ms> — relative (also: arrows in the window)");
 
     let stdin = tokio::io::stdin();
@@ -352,23 +402,22 @@ async fn run_console(player: Player) {
                 Some(i) => pick_audio(&player, i),
                 None => println!("usage: a <index>"),
             },
-            // subfile <path> [offset_ms]: load a sidecar .vtt/.srt and show it.
-            "subfile" => match arg {
-                Some(path) => {
-                    let offset = parts.next().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                    match std::fs::read(path) {
-                        Ok(bytes) => match player.add_external_subtitle_track(
-                            &bytes,
-                            player::ExternalSubtitleOptions { time_offset_ms: offset, ..Default::default() },
-                        ) {
-                            Ok(track) => player.set_subtitle_track(&track),
-                            Err(e) => println!("subfile: {e}"),
-                        },
-                        Err(e) => println!("subfile: {path}: {e}"),
-                    }
-                }
+            // subfile <path> [offset_ms]: load a sidecar .vtt/.srt/.ass and
+            // show it. The path may contain spaces (quote it, or not).
+            "subfile" => match parse_subfile_args(trimmed["subfile".len()..].trim()) {
+                Some((path, offset)) => load_subtitle_file(&player, std::path::Path::new(&path), offset),
                 None => println!("usage: subfile <path> [offset_ms]"),
             },
+            // subfonts <dir>: every font in a folder, for ASS subtitles.
+            "subfonts" => {
+                let dir = trimmed["subfonts".len()..].trim().trim_matches('"');
+                if dir.is_empty() {
+                    println!("usage: subfonts <dir>");
+                } else {
+                    let n = bridge::fixture::add_font_dir(&player, std::path::Path::new(dir));
+                    println!("subfonts: {n} faces from {dir}");
+                }
+            }
             "seek" => match arg {
                 Some(a) if a.starts_with('+') || a.starts_with('-') => match a.parse::<i64>() {
                     Ok(delta) => {

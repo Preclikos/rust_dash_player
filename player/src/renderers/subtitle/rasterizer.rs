@@ -43,7 +43,7 @@ impl FontSet {
 /// not only where the system happens to ship it. The static build (305 KB)
 /// rather than the variable one: fontdue renders a variable font at its
 /// default instance anyway.
-const DEFAULT_FONT: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Regular.ttf");
+pub(super) const DEFAULT_FONT: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Regular.ttf");
 
 /// Fallback face baked into the binary: DejaVu Sans (Bitstream Vera +
 /// public-domain changes, see assets/fonts/LICENSE). Roboto lacks the
@@ -52,7 +52,7 @@ const DEFAULT_FONT: &[u8] = include_bytes!("../../../assets/fonts/Roboto-Regular
 /// without coverage those render as the `.notdef` tofu box. DejaVu covers
 /// them, so it supplies exactly the glyphs the primary face lacks
 /// (`FontSet::for_char`).
-const FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
+pub(super) const FALLBACK_FONT: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSans.ttf");
 
 /// Parse the embedded primary font. Infallible in practice (the bytes are
 /// compiled in and known-good); returns `None` only if a future font swap

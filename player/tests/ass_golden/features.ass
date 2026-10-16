@@ -1,0 +1,63 @@
+[Script Info]
+; Golden test script for the ASS renderer: one feature group per second.
+; References are rendered by libass (ffmpeg -vf subtitles); see
+; scripts/ass_golden.sh. Fonts: only the faces in player/assets/fonts.
+ScriptType: v4.00+
+PlayResX: 640
+PlayResY: 360
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,DejaVu Sans,26,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,1,2,20,20,20,1
+Style: Top,DejaVu Sans,22,&H0000FFFF,&H000000FF,&H00402010,&H80000000,-1,0,0,0,100,100,0,0,1,1.5,1,8,20,20,15,1
+Style: Box,DejaVu Sans,24,&H00FFFFFF,&H000000FF,&H00803000,&H00000000,0,0,0,0,100,100,0,0,3,3,2,2,20,20,40,1
+Style: Robo,RobotoStatic,28,&H00F0F0F0,&H000000FF,&H00101010,&H80000000,0,0,0,0,100,100,1,0,1,2,2,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+; 0 s: plain dialogue, top style, colliding bottom lines
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,Plain dialogue with ěščřžýáíé
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,A second line that collides
+Dialogue: 0,0:00:00.00,0:00:01.00,Top,,0,0,0,,Top style, bold, yellow
+; 1 s: bold / italic / underline / strike / size / scale / spacing
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\b1}Bold{\b0} {\i1}Italic{\i0} {\u1}Under{\u0} {\s1}Strike{\s0}
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\an8\fs40}Big {\fs16}small {\fscx150}wide{\fscx100} {\fscy60}flat{\fscy100} {\fsp6}spaced
+; 2 s: borders, shadows, blur, be, colours, alpha
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\an7\pos(20,20)\bord4\shad0\3c&H0000FF&}Thick red border
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\an7\pos(20,70)\xbord6\ybord1\yshad4\xshad-3\4c&H00FF00&}Elliptic border, green shadow
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\an7\pos(20,120)\blur3\bord3}Gaussian blur
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\an7\pos(20,170)\be2\bord2\c&HFFC080&}Box blur be2
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\an7\pos(20,220)\1a&H80&\bord2}Half transparent fill
+Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,{\an7\pos(20,270)\bord0\shad3\4a&H40&}Shadow only, no border
+; 3 s: opaque box style, alignment grid
+Dialogue: 0,0:00:03.00,0:00:04.00,Box,,0,0,0,,Opaque box\Nborder style 3
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an7}7
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an8}8
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an9}9
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an4}4
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an5}5
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an6}6
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an1}1
+Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,{\an3}3
+; 4 s: rotation and shear
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\an5\pos(160,90)\frz30}Rotated 30
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\an5\pos(480,90)\frx50\fry20}Tilted 3D
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\an5\pos(160,250)\org(320,180)\frz-20}Origin rotate
+Dialogue: 0,0:00:04.00,0:00:05.00,Default,,0,0,0,,{\an5\pos(480,250)\fax0.4\fay-0.1}Sheared
+; 5 s: clips and drawings
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\an7\pos(20,20)\fs40\clip(20,20,200,45)}Clipped rectangle
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\an7\pos(20,80)\fs40\iclip(60,80,180,110)}Inverse clipped
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\an7\pos(20,150)\fs40\clip(m 20 150 l 300 150 160 200)}Vector clip
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\an7\pos(400,40)\bord2\shad2\c&H3060E0&\p1}m 0 0 l 100 0 100 60 50 100 0 60{\p0}
+Dialogue: 0,0:00:05.00,0:00:06.00,Default,,0,0,0,,{\an7\pos(420,180)\bord1\c&H20C020&\p2}m 0 0 b 100 0 200 100 200 200 s 100 300 0 200 -100 100 c{\p0}
+; 6 s: animation, mid-way (fade, move, transform, karaoke)
+Dialogue: 0,0:00:05.50,0:00:07.50,Default,,0,0,0,,{\fad(1000,0)\an7\pos(20,20)}Fading in
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\an7\move(20,60,400,60)}Moving
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\an7\pos(20,110)\t(0,1000,\c&H0000FF&\fscx200\bord6)}Transform
+Dialogue: 0,0:00:06.00,0:00:07.00,Default,,0,0,0,,{\an7\pos(20,170)\kf50}Kara{\kf50}oke {\k50}fill {\ko50}outline
+; 7 s: wrapping
+Dialogue: 0,0:00:07.00,0:00:08.00,Default,,0,0,0,,This is a deliberately long line of dialogue that has to wrap at the margins and rebalance its lines
+Dialogue: 0,0:00:07.00,0:00:08.00,Top,,0,0,0,,{\q2}No wrapping in style two, so this runs off the edge of the frame entirely
+Dialogue: 0,0:00:07.00,0:00:08.00,Robo,,0,0,0,,{\an5}Robo{\fnDejaVu Sans}to and DejaVu\Nsecond line

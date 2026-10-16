@@ -1780,6 +1780,19 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         Ok(())
     }
 
+    /// Add a font file (TTF, OTF or a TTC collection) for styled ASS/SSA
+    /// subtitles. Scripts name their fonts (`Open Sans Semibold`, `Trebuchet
+    /// MS`); every added face is matched against those names the way libass
+    /// does, ahead of the built-in fallback faces. Add as many as the host
+    /// has — a fonts folder, MKV attachments, user downloads. Fonts listed
+    /// in a manifest (DVB font download) and in a script's `[Fonts]` are
+    /// picked up without this call. Returns the number of faces added (0
+    /// for unreadable bytes or a file added before). Kept across tracks and
+    /// `open_url`.
+    pub fn add_subtitle_font(&self, bytes: Vec<u8>) -> usize {
+        self.video_renderer.add_subtitle_font(bytes)
+    }
+
     /// Set the subtitle overlay's visual style — text/outline colour and a
     /// size multiplier (see [`SubtitleStyle`]). Values are sanitised into
     /// the safe rendering range before being applied, and the change takes

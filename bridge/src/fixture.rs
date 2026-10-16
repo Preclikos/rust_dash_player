@@ -67,6 +67,25 @@ pub(crate) fn video_pref() -> Option<String> {
 /// the `env` var on desktop, or a one-line `<file>` in the app's external
 /// files dir on Android (`adb push`-able without root). Returns the
 /// trimmed value or `None` when unset. `file` is only read on Android.
+/// Add every `.ttf` / `.otf` / `.ttc` in `dir` as a subtitle font; the
+/// number of faces added.
+pub fn add_font_dir(player: &player::Player, dir: &std::path::Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        log::warn!("subtitle fonts: {} not readable", dir.display());
+        return 0;
+    };
+    let mut faces = 0;
+    for path in entries.flatten().map(|e| e.path()) {
+        let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+        if matches!(ext.as_str(), "ttf" | "otf" | "ttc") {
+            if let Ok(bytes) = std::fs::read(&path) {
+                faces += player.add_subtitle_font(bytes);
+            }
+        }
+    }
+    faces
+}
+
 pub(crate) fn sub_pref(env: &str, file: &str) -> Option<String> {
     if let Ok(v) = std::env::var(env) {
         let v = v.trim().to_string();
@@ -466,6 +485,12 @@ pub(crate) fn apply_default_tracks(
             },
             Err(e) => log::warn!("subtitle font unreadable ({}): {}", path, e),
         }
+    }
+
+    // Fonts for styled (ASS) subtitles: every font file in a directory.
+    if let Some(dir) = sub_pref("RUST_PLAYER_SUB_FONTS", "sub_fonts_dir.txt") {
+        let faces = add_font_dir(&player, std::path::Path::new(&dir));
+        log::info!("subtitle fonts: {} faces from {}", faces, dir);
     }
 
     // Apply the chosen text track (style + select) when the manifest has one.

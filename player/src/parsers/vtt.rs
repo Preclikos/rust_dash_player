@@ -31,6 +31,10 @@ pub struct VttCue {
     pub settings: String,
     /// `settings` parsed — what the overlay actually positions by.
     pub layout: CueLayout,
+    /// Set when the cue is an ASS event: `text` and `layout` are then its
+    /// plain rendering (see [`crate::parsers::ass::plain`]) and this links
+    /// to the event for renderers that draw it styled.
+    pub ass: Option<crate::parsers::ass::AssCue>,
 }
 
 /// Where a cue goes, from its WebVTT cue settings. Field for field what
@@ -364,6 +368,7 @@ pub(crate) fn parse_cue_block(block: &str) -> Option<VttCue> {
         text,
         settings,
         layout,
+        ass: None,
     })
 }
 
@@ -620,6 +625,7 @@ fn parse_vttc(body: &[u8], start_ms: i64, end_ms: i64) -> Option<VttCue> {
         text: payload,
         settings,
         layout,
+        ass: None,
     })
 }
 

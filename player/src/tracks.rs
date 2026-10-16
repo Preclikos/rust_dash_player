@@ -576,8 +576,21 @@ impl Tracks {
     async fn parse_text_adaptation(
         base_url: &str,
         adaptation: &AdaptationSet,
+        raw_mpd: &str,
         http: &HttpClient,
     ) -> Result<TextAdaptation, Box<dyn Error>> {
+        let fonts: Vec<crate::manifest::FontDownload> = slice_adaptation_set(raw_mpd, adaptation.id)
+            .map(crate::manifest::find_font_downloads)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|mut f| {
+                if !f.url.starts_with("http://") && !f.url.starts_with("https://") {
+                    f.url = format!("{}{}", base_url, f.url);
+                }
+                f
+            })
+            .collect();
+        let fonts = &fonts;
         // Concurrent (order-preserving) — see PREPARE_REP_CONCURRENCY.
         // String errors across the fan-out; see the video note.
         let text_futs: Vec<_> = adaptation.representations.iter().map(|representation| {
@@ -653,6 +666,7 @@ impl Tracks {
                 segments,
                 single_file_url,
                 external_cues: None,
+                fonts: fonts.clone(),
             })
         };
             async move { fut.await.map_err(|e| e.to_string()) }
@@ -726,7 +740,7 @@ impl Tracks {
         let text_futs: Vec<_> = text_sets
             .into_iter()
             .map(|adaptation| {
-                let fut = Self::parse_text_adaptation(base, adaptation, http);
+                let fut = Self::parse_text_adaptation(base, adaptation, raw_mpd, http);
                 async move { fut.await.map_err(|e| e.to_string()) }
             })
             .collect();

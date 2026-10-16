@@ -263,6 +263,62 @@ pub fn find_descriptor_values(block: &str, scheme_substring: &str) -> Vec<String
     out
 }
 
+/// A font a text track asks the player to download (DVB-DASH font
+/// download descriptor, ETSI TS 103 285 §7.2.1.1):
+///
+/// ```xml
+/// <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+///     dvb:url="fonts/OpenSans-SemiBold.ttf" dvb:fontFamily="Open Sans Semibold"
+///     dvb:mimeType="application/font-sfnt"/>
+/// ```
+///
+/// An `EssentialProperty` marks the font as required for the track; a
+/// track may carry any number of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FontDownload {
+    pub url: String,
+    pub family: Option<String>,
+    pub mime_type: Option<String>,
+    pub essential: bool,
+}
+
+/// Every DVB font download descriptor in `block`. Attributes are matched by
+/// local name (`dvb:url`, or `url` under any prefix).
+pub fn find_font_downloads(block: &str) -> Vec<FontDownload> {
+    let attr = |tag: &str, name: &str| -> Option<String> {
+        let mut rest = tag;
+        while let Some(i) = rest.find(&format!("{name}=\"")) {
+            let before = rest[..i].chars().last();
+            let after = &rest[i + name.len() + 2..];
+            if matches!(before, Some(':') | Some(' ') | Some('\n') | Some('\t') | Some('\r')) {
+                return after.find('"').map(|e| after[..e].to_string());
+            }
+            rest = after;
+        }
+        None
+    };
+    let mut out = Vec::new();
+    let mut cursor = block;
+    while let Some(open) = cursor.find('<') {
+        let after = &cursor[open + 1..];
+        let Some(tag_end) = after.find('>') else { break };
+        let tag = &after[..tag_end];
+        let essential = tag.starts_with("EssentialProperty");
+        if (essential || tag.starts_with("SupplementalProperty")) && tag.contains("urn:dvb:dash:fontdownload:2014") {
+            if let Some(url) = attr(tag, "url") {
+                out.push(FontDownload {
+                    url,
+                    family: attr(tag, "fontFamily"),
+                    mime_type: attr(tag, "mimeType"),
+                    essential,
+                });
+            }
+        }
+        cursor = &after[tag_end + 1..];
+    }
+    out
+}
+
 /// Parse the comma-separated `@value` of any
 /// `<SupplementalProperty schemeIdUri="urn:mpeg:dash:adaptation-set-switching:2016" value="..."/>`
 /// inside `block` and return the referenced AdaptationSet IDs.
@@ -446,6 +502,24 @@ mod tests {
     // -------------------------------------------------------------------
     // find_descriptor_values
     // -------------------------------------------------------------------
+
+    #[test]
+    fn font_downloads_are_found_with_any_prefix_and_many_per_set() {
+        let block = r#"<AdaptationSet id="9" contentType="text" mimeType="text/x-ssa">
+            <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+                dvb:url="fonts/OpenSans-SemiBold.ttf" dvb:fontFamily="Open Sans Semibold" dvb:mimeType="application/font-sfnt"/>
+            <EssentialProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1" x:url="https://cdn/x/Roboto-Medium.ttf"/>
+            <SupplementalProperty schemeIdUri="urn:other" dvb:url="nope.ttf"/>
+            <Representation id="1" bandwidth="1" mimeType="text/x-ssa"><BaseURL>cs.ass</BaseURL></Representation>"#;
+        let f = find_font_downloads(block);
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].url, "fonts/OpenSans-SemiBold.ttf");
+        assert_eq!(f[0].family.as_deref(), Some("Open Sans Semibold"));
+        assert_eq!(f[0].mime_type.as_deref(), Some("application/font-sfnt"));
+        assert!(!f[0].essential);
+        assert_eq!(f[1].url, "https://cdn/x/Roboto-Medium.ttf");
+        assert!(f[1].essential);
+    }
 
     #[test]
     fn find_descriptor_values_finds_supplemental_property_values() {

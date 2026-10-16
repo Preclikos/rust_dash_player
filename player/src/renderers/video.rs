@@ -3297,6 +3297,9 @@ impl VideoRenderer {
         ));
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         overlay.set_pq_output(self.apple_output.edr.is_active());
+        if let Ok(size) = self.frame_size.try_read() {
+            overlay.set_video_size(size.width, size.height);
+        }
         *slot = Some(overlay.clone());
         overlay
     }
@@ -3326,12 +3329,19 @@ impl super::VideoSink for VideoRenderer {
     }
 
     fn change_frame_size(&self, size: PhysicalSize<u32>) -> impl std::future::Future<Output = ()> + Send + '_ {
+        if let Some(ov) = self.subtitle_overlay.lock().unwrap().as_ref() {
+            ov.set_video_size(size.width, size.height);
+        }
         VideoRenderer::change_frame_size(self, size)
     }
 
     fn set_subtitle_font(&self, bytes: Vec<u8>) -> Result<(), String> {
         let overlay = self.ensure_subtitle_overlay();
         overlay.set_font(bytes)
+    }
+
+    fn add_subtitle_font(&self, bytes: Vec<u8>) -> usize {
+        self.ensure_subtitle_overlay().add_ass_font(bytes)
     }
 
     fn set_subtitle_style(&self, style: crate::SubtitleStyle) {
