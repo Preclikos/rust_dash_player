@@ -4,7 +4,9 @@
 //! and reads positions back in 26.6; `kern` is on only when the script says
 //! `Kerning: yes`, `liga`/`clig` are off when letter spacing is non-zero.
 
-use harfrust::{Buffer, Direction, Feature, Language, Script, ShapeOptions, ShaperFont, Tag};
+use std::sync::Arc;
+
+use harfrust::{Buffer, Direction, Feature, Language, Script, ShapeOptions, ShapePlan, ShaperFont, Tag};
 use unicode_script::UnicodeScript;
 
 use super::fonts::Face;
@@ -33,8 +35,16 @@ pub struct RunOptions {
     pub ligatures: bool,
 }
 
-/// Shape `text` set in `face` at `size` px (libass REAL_DIM size).
-pub fn shape_run(face: &Face, size: f64, text: &[char], opts: &RunOptions) -> Vec<Shaped> {
+/// Compiled shaping plans by face (font database index), the buffer's
+/// direction, script and language, and the features switched on (kern,
+/// liga/clig, vert/vkna). Compiling one (feature lookup, sorting) cost as
+/// much as the shaping itself, for every run of every frame.
+pub type PlanKey = (usize, Direction, Option<Script>, Option<Language>, [bool; 3]);
+pub type PlanCache = super::HashMap<PlanKey, Arc<ShapePlan>>;
+
+/// Shape `text` set in `face` at `size` px (libass REAL_DIM size); with
+/// `plans`, the face's database index and the plan cache to reuse.
+pub fn shape_run(face: &Face, size: f64, text: &[char], opts: &RunOptions, plans: Option<(usize, &mut PlanCache)>) -> Vec<Shaped> {
     let em_d6 = (face.units_per_em as f64 * face.units_to_d6(size)).round() as i32;
     let shaper = ShaperFont::new(&face.font).with_scale(em_d6.max(1));
     let mut buf = Buffer::new();
@@ -54,7 +64,16 @@ pub fn shape_run(face: &Face, size: f64, text: &[char], opts: &RunOptions) -> Ve
         Feature::new(Tag::new(b"vert"), opts.vertical as u32, ..),
         Feature::new(Tag::new(b"vkna"), opts.vertical as u32, ..),
     ];
-    if harfrust::shape(&shaper, &mut buf, ShapeOptions::new().features(&features)).is_err() {
+    let plan = plans.map(|(face_id, cache)| {
+        let key = (face_id, buf.direction(), buf.script(), buf.language().cloned(), [opts.kerning, opts.ligatures, opts.vertical]);
+        if cache.len() > 512 {
+            cache.clear();
+        }
+        Arc::clone(cache.entry(key).or_insert_with(|| {
+            Arc::new(ShapePlan::new(&face.font, buf.direction(), buf.script(), buf.language(), &features))
+        }))
+    });
+    if harfrust::shape(&shaper, &mut buf, ShapeOptions::new().features(&features).plan(plan.as_deref())).is_err() {
         // Malformed font tables: lay the characters out by nominal advance.
         return text
             .iter()
@@ -150,7 +169,7 @@ mod tests {
         let db = FontDb::new(builtin_faces());
         let face = db.face(0);
         let text: Vec<char> = "Hi".chars().collect();
-        let out = shape_run(face, 64.0, &text, &RunOptions { rtl: false, script: None, language: None, vertical: false, kerning: false, ligatures: true });
+        let out = shape_run(face, 64.0, &text, &RunOptions { rtl: false, script: None, language: None, vertical: false, kerning: false, ligatures: true }, None);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].cluster, 0);
         assert_eq!(out[1].cluster, 1);

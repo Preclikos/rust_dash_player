@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Reference DASH manifest for styled ASS/SSA subtitles (rust player >= 0.2.21).
+  See PLAYER_INTEGRATION.md §9 "ASS / SSA".
+
+  The media part is an ordinary on-demand profile (SegmentBase, one file per
+  Representation). The subtitle part is what matters:
+
+  * one text AdaptationSet per ASS track: mimeType="text/x-ssa" and/or
+    codecs="ass" (either marks it ASS), the whole .ass file in BaseURL;
+  * fonts for that track as DVB-DASH font download descriptors
+    (ETSI TS 103 285 §7.2.1.2), any number per track, fetched before the
+    track's first frame; URLs resolve against the MPD's location;
+      EssentialProperty    = the track needs this font (a failed download is
+                             logged as an error),
+      SupplementalProperty = nice to have (logged as a warning);
+    either way a missing face falls back like any font the script names
+    but nobody supplied;
+  * dvb:fontFamily is informational; the player matches the family names
+    inside the font file against the names the script uses;
+  * mimeType / codecs may sit on the AdaptationSet or on each
+    Representation; Representation ids may be any string.
+
+  Media here = the Tears of Steel test asset; paths relative to this file.
+-->
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     xmlns:dvb="urn:dvb:metadata:dash:2014"
+     profiles="urn:mpeg:dash:profile:isoff-on-demand:2011"
+     type="static" minBufferTime="PT2S" mediaPresentationDuration="PT734S">
+  <Period id="0">
+
+    <!-- Video: HEVC ladder -->
+    <AdaptationSet id="0" contentType="video" mimeType="video/mp4" subsegmentAlignment="true"
+                   maxWidth="2560" maxHeight="1144" frameRate="24/1">
+      <Representation id="video-1144p" bandwidth="8000000" codecs="hvc1.1.2.L150.90" width="2560" height="1144" sar="3429:3428">
+        <BaseURL>video_1143p_8000k.mp4</BaseURL>
+        <SegmentBase indexRange="979-2486" timescale="24"><Initialization range="0-978"/></SegmentBase>
+      </Representation>
+      <Representation id="video-858p" bandwidth="6000000" codecs="hvc1.1.2.L120.90" width="1920" height="858" sar="1:1">
+        <BaseURL>video_857p_6000k.mp4</BaseURL>
+        <SegmentBase indexRange="959-2466" timescale="24"><Initialization range="0-958"/></SegmentBase>
+      </Representation>
+      <Representation id="video-572p" bandwidth="3000000" codecs="hvc1.1.2.L93.90" width="1280" height="572" sar="1713:1714">
+        <BaseURL>video_571p_3000k.mp4</BaseURL>
+        <SegmentBase indexRange="978-2485" timescale="24"><Initialization range="0-977"/></SegmentBase>
+      </Representation>
+    </AdaptationSet>
+
+    <!-- Audio -->
+    <AdaptationSet id="1" contentType="audio" mimeType="audio/mp4" lang="en" subsegmentAlignment="true">
+      <Representation id="audio-en" bandwidth="196000" codecs="mp4a.40.2" audioSamplingRate="44100">
+        <AudioChannelConfiguration schemeIdUri="urn:mpeg:dash:23003:3:audio_channel_configuration:2011" value="2"/>
+        <BaseURL>audio_eng_2ch_aac.mp4</BaseURL>
+        <SegmentBase indexRange="833-2340" timescale="44100"><Initialization range="0-832"/></SegmentBase>
+      </Representation>
+    </AdaptationSet>
+
+    <!-- ASS track 1 (Czech): dialogue + signs. One required font, one
+         optional; Roboto ships with the player as fallback anyway. -->
+    <AdaptationSet id="2" contentType="text" mimeType="text/x-ssa" codecs="ass" lang="cs">
+      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="subtitle"/>
+      <EssentialProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/GandhiSans-Bold.otf" dvb:fontFamily="Gandhi Sans"
+          dvb:mimeType="application/font-sfnt"/>
+      <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/Roboto.ttf" dvb:fontFamily="Roboto"
+          dvb:mimeType="application/font-sfnt"/>
+      <Representation id="sub-cs" bandwidth="1000">
+        <BaseURL>subs/mushoku-cs.ass</BaseURL>
+      </Representation>
+    </AdaptationSet>
+
+    <!-- ASS track 2 (English): heavy typesetting, several fonts incl. a
+         CJK one (13 MB — downloaded only when this track is selected). -->
+    <AdaptationSet id="3" contentType="text" mimeType="text/x-ssa" codecs="ass" lang="en">
+      <Role schemeIdUri="urn:mpeg:dash:role:2011" value="subtitle"/>
+      <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/Lato-Regular.ttf" dvb:fontFamily="Lato"
+          dvb:mimeType="application/font-sfnt"/>
+      <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/FranklinGothicBook.ttf" dvb:fontFamily="Franklin Gothic Book"
+          dvb:mimeType="application/font-sfnt"/>
+      <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/Arial.ttf" dvb:fontFamily="Arial"
+          dvb:mimeType="application/font-sfnt"/>
+      <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/GandhiSans-Bold.otf" dvb:fontFamily="Gandhi Sans"
+          dvb:mimeType="application/font-sfnt"/>
+      <SupplementalProperty schemeIdUri="urn:dvb:dash:fontdownload:2014" value="1"
+          dvb:url="fonts/FOT-TsukuCOldMinPr6N-R.otf" dvb:fontFamily="FOT-TsukuCOldMin Pr6N R"
+          dvb:mimeType="application/font-sfnt"/>
+      <Representation id="sub-en-stress" bandwidth="1000">
+        <BaseURL>subs/stress.ass</BaseURL>
+      </Representation>
+    </AdaptationSet>
+
+    <!-- Plain WebVTT next to ASS works as before (a sidecar-style single
+         file; segmented WebVTT in ISO BMFF too). Not used here. -->
+
+  </Period>
+</MPD>

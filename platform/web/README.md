@@ -18,6 +18,21 @@ uploaded as two textures, so the NV12 / P010 shaders, the HDR tonemap and
 the subtitle overlay are the shared ones. Everything runs on the page's
 main thread (no `SharedArrayBuffer` / atomics needed).
 
+## ASS subtitles: the render worker
+
+Styled (ASS) subtitles render in a dedicated Web Worker, not on the page's
+thread that also decodes and presents the video. The worker is a second
+instance of this module: its script is embedded and started from a Blob
+URL, and it imports `rustplayer.js` from where the module was loaded, so
+there is nothing extra to serve or bundle. Options of `RustPlayer.create`:
+
+- `assWorker: false` — render ASS on the page's thread (the frames then
+  drop resolution earlier to keep the video smooth);
+- `assWorkerModuleUrl` — absolute URL of `rustplayer.js`, for bundlers that
+  move it away from its `snippets/` directory.
+
+If the worker can't start, ASS renders on the page's thread (logged).
+
 ## Build & run
 
 ```powershell

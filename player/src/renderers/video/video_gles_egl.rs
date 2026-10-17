@@ -322,6 +322,33 @@ void main() {
     out_color = texture(u_texture, v_tex);
 }";
 
+// ASS frame as masks (subtitle::ass::Layers): each image a quad sampling its
+// 8-bit coverage from the atlas in its own premultiplied colour, all in
+// one draw. Positions are 0..1 inside the frame's box (y down), placed by
+// the same NDC rect as a cue.
+const VS_MASK_SRC: &str = "#version 300 es
+in vec2 a_pos;
+in vec2 a_tex;
+in vec4 a_color;
+uniform vec4 u_rect; // center_x, center_y, half_w, half_h (NDC)
+out vec2 v_tex;
+out vec4 v_color;
+void main() {
+    gl_Position = vec4(u_rect.x + (a_pos.x * 2.0 - 1.0) * u_rect.z, u_rect.y - (a_pos.y * 2.0 - 1.0) * u_rect.w, 0.0, 1.0);
+    v_tex = a_tex;
+    v_color = a_color;
+}";
+
+const FS_MASK_SRC: &str = "#version 300 es
+precision mediump float;
+uniform sampler2D u_texture;
+in vec2 v_tex;
+in vec4 v_color;
+out vec4 out_color;
+void main() {
+    out_color = v_color * texture(u_texture, v_tex).r;
+}";
+
 // SDR (BT.709, display gamma) → PQ BT.2020 up-conversion, for SDR frames
 // rendered while the surface is locked to the BT2020_PQ dataspace (ABR
 // switched to an SDR rep mid-HDR-session). BT.2408: SDR reference white
@@ -737,6 +764,20 @@ struct SubtitleGl {
     texture: glow::Texture,
     /// Generation of the bitmap currently in `texture` (0 = none yet).
     uploaded_generation: std::sync::atomic::AtomicU64,
+    /// ASS mask frames: program, its vertex array + buffer and the R8
+    /// atlas texture (None when the program did not build: mask frames
+    /// are then not drawn).
+    masks: Option<MaskGl>,
+}
+
+struct MaskGl {
+    program: glow::Program,
+    rect_loc: Option<glow::UniformLocation>,
+    vao: glow::VertexArray,
+    vbo: glow::Buffer,
+    texture: glow::Texture,
+    uploaded_generation: std::sync::atomic::AtomicU64,
+    vertex_count: std::sync::atomic::AtomicI32,
 }
 
 /// A program with just the geometry/crop uniforms (SDR→PQ up-convert).
@@ -976,11 +1017,56 @@ impl GlesOesRenderer {
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
             gl.bind_texture(glow::TEXTURE_2D, None);
+            let masks = (|| -> Result<MaskGl, String> {
+                let vs = compile_shader(gl, glow::VERTEX_SHADER, VS_MASK_SRC)?;
+                let fs = compile_shader(gl, glow::FRAGMENT_SHADER, FS_MASK_SRC)?;
+                let program = link_program(gl, vs, fs)?;
+                gl.delete_shader(vs);
+                gl.delete_shader(fs);
+                gl.use_program(Some(program));
+                if let Some(loc) = gl.get_uniform_location(program, "u_texture") {
+                    gl.uniform_1_i32(Some(&loc), 1);
+                }
+                let rect_loc = gl.get_uniform_location(program, "u_rect");
+                gl.use_program(None);
+                let vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
+                let vbo = gl.create_buffer().map_err(|e| e.to_string())?;
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                let stride = (crate::renderers::subtitle::ass::LAYER_VERTEX_FLOATS * 4) as i32;
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, stride, 8);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_f32(2, 4, glow::FLOAT, false, stride, 16);
+                gl.bind_vertex_array(None);
+                gl.bind_buffer(glow::ARRAY_BUFFER, None);
+                let texture = gl.create_texture().map_err(|e| e.to_string())?;
+                gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                gl.bind_texture(glow::TEXTURE_2D, None);
+                Ok(MaskGl {
+                    program,
+                    rect_loc,
+                    vao,
+                    vbo,
+                    texture,
+                    uploaded_generation: std::sync::atomic::AtomicU64::new(0),
+                    vertex_count: std::sync::atomic::AtomicI32::new(0),
+                })
+            })()
+            .map_err(|e| log::warn!("[gles_oes] subtitle mask program unavailable: {}", e))
+            .ok();
             Ok(SubtitleGl {
                 program,
                 rect_loc,
                 texture,
                 uploaded_generation: std::sync::atomic::AtomicU64::new(0),
+                masks,
             })
         })()
         .map_err(|e| log::warn!("[gles_oes] subtitle program unavailable: {}", e))
@@ -1357,6 +1443,19 @@ impl GlesOesRenderer {
         if bmp.width == 0 || bmp.height == 0 || viewport_width <= 0 || viewport_height <= 0 {
             return;
         }
+        let parent = crate::renderers::subtitle::CueParent::from_scale(
+            viewport_width as u32,
+            viewport_height as u32,
+            scale_x,
+            scale_y,
+            bottom_inset_px,
+            anchor,
+        );
+        if let Some(layers) = &bmp.masks {
+            let Some(m) = &sub.masks else { return };
+            self.draw_subtitle_masks(gl, m, bmp.generation, layers, crate::renderers::subtitle::cue_quad(bmp, &parent));
+            return;
+        }
         gl.active_texture(glow::TEXTURE1);
         gl.bind_texture(glow::TEXTURE_2D, Some(sub.texture));
         if sub
@@ -1378,7 +1477,8 @@ impl GlesOesRenderer {
         }
 
         gl.enable(glow::BLEND);
-        gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+        // The cue bitmap is premultiplied.
+        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
         gl.use_program(Some(sub.program));
         // Same geometry as the wgpu overlay: the cue lives inside the
         // aspect-fitted picture (ExoPlayer's SubtitleView sits inside the
@@ -1386,14 +1486,6 @@ impl GlesOesRenderer {
         // bottom by default, the host inset raising that bottom edge for
         // system bars / TV overscan. In direct mode the OS fits the video
         // plane to the same window, so the picture rect is the same.
-        let parent = crate::renderers::subtitle::CueParent::from_scale(
-            viewport_width as u32,
-            viewport_height as u32,
-            scale_x,
-            scale_y,
-            bottom_inset_px,
-            anchor,
-        );
         let [center_x, center_y, half_w, half_h] =
             crate::renderers::subtitle::cue_quad(bmp, &parent);
         if let Some(ref loc) = sub.rect_loc {
@@ -1401,6 +1493,57 @@ impl GlesOesRenderer {
         }
         gl.bind_vertex_array(Some(self.vao));
         gl.draw_arrays(glow::TRIANGLES, 0, 6);
+        gl.bind_vertex_array(None);
+        gl.use_program(None);
+        gl.disable(glow::BLEND);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        gl.active_texture(glow::TEXTURE0);
+    }
+}
+
+impl GlesOesRenderer {
+    /// An ASS frame as masks: atlas + vertices uploaded when the frame
+    /// changed, then one premultiplied-alpha draw at `rect` (NDC).
+    unsafe fn draw_subtitle_masks(
+        &self,
+        gl: &glow::Context,
+        m: &MaskGl,
+        generation: u64,
+        layers: &crate::renderers::subtitle::ass::Layers,
+        rect: [f32; 4],
+    ) {
+        gl.active_texture(glow::TEXTURE1);
+        gl.bind_texture(glow::TEXTURE_2D, Some(m.texture));
+        if m.uploaded_generation.swap(generation, std::sync::atomic::Ordering::Relaxed) != generation {
+            // atlas rows are 1 byte per texel, any width
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::R8 as i32,
+                layers.atlas_w as i32,
+                layers.atlas_h as i32,
+                0,
+                glow::RED,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&layers.atlas)),
+            );
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(m.vbo));
+            let bytes: &[u8] = std::slice::from_raw_parts(layers.vertices.as_ptr() as *const u8, layers.vertices.len() * 4);
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
+            gl.bind_buffer(glow::ARRAY_BUFFER, None);
+            let count = (layers.vertices.len() / crate::renderers::subtitle::ass::LAYER_VERTEX_FLOATS) as i32;
+            m.vertex_count.store(count, std::sync::atomic::Ordering::Relaxed);
+        }
+        gl.enable(glow::BLEND);
+        gl.blend_func(glow::ONE, glow::ONE_MINUS_SRC_ALPHA);
+        gl.use_program(Some(m.program));
+        if let Some(ref loc) = m.rect_loc {
+            gl.uniform_4_f32(Some(loc), rect[0], rect[1], rect[2], rect[3]);
+        }
+        gl.bind_vertex_array(Some(m.vao));
+        gl.draw_arrays(glow::TRIANGLES, 0, m.vertex_count.load(std::sync::atomic::Ordering::Relaxed));
         gl.bind_vertex_array(None);
         gl.use_program(None);
         gl.disable(glow::BLEND);
@@ -1435,6 +1578,7 @@ unsafe fn link_program(
     gl.attach_shader(program, fs);
     gl.bind_attrib_location(program, 0, "a_pos");
     gl.bind_attrib_location(program, 1, "a_tex");
+    gl.bind_attrib_location(program, 2, "a_color");
     gl.link_program(program);
     if !gl.get_program_link_status(program) {
         let log = gl.get_program_info_log(program);

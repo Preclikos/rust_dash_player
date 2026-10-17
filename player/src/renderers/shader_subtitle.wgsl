@@ -66,3 +66,48 @@ fn fs_main_pq(in: VertexOut) -> @location(0) vec4<f32> {
     }
     return vec4<f32>(sdr_display_rgb_to_pq(c.rgb / c.a) * c.a, c.a);
 }
+
+// ASS frames as masks (player::renderers::subtitle::ass::Layers): one
+// triangle list, each image a quad sampling its 8-bit coverage from the
+// atlas in its own premultiplied colour, blended in paint order. `quad`
+// places the frame's bounding box like a cue; vertex positions are 0..1
+// inside it (y down).
+
+struct MaskIn {
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct MaskOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+};
+
+@vertex
+fn vs_mask(v: MaskIn) -> MaskOut {
+    var out: MaskOut;
+    out.position = vec4<f32>(
+        quad.transform.x + (v.pos.x * 2.0 - 1.0) * quad.transform.z,
+        quad.transform.y - (v.pos.y * 2.0 - 1.0) * quad.transform.w,
+        0.0, 1.0,
+    );
+    out.uv = v.uv * quad.uv_scale.xy;
+    out.color = v.color;
+    return out;
+}
+
+@fragment
+fn fs_mask(in: MaskOut) -> @location(0) vec4<f32> {
+    return in.color * textureSample(t_tex, s_tex, in.uv).r;
+}
+
+@fragment
+fn fs_mask_pq(in: MaskOut) -> @location(0) vec4<f32> {
+    let c = in.color * textureSample(t_tex, s_tex, in.uv).r;
+    if (c.a <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(sdr_display_rgb_to_pq(c.rgb / c.a) * c.a, c.a);
+}

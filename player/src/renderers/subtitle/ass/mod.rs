@@ -26,7 +26,59 @@ mod layout;
 mod outline;
 mod shape;
 
-use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// The renderer's maps: keys are its own (glyph ids, sizes, cache keys),
+/// so FxHash (rustc's hasher) instead of SipHash, which is several times
+/// slower on 32-bit ARM TV boxes and showed up there in every glyph lookup.
+pub(crate) type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+#[derive(Default, Clone, Copy)]
+pub(crate) struct FxHasher(u64);
+
+impl FxHasher {
+    #[inline]
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, rest) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        for &b in rest {
+            self.add(b as u64);
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, v: u8) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.add(v);
+    }
+    #[inline]
+    fn write_usize(&mut self, v: usize) {
+        self.add(v as u64);
+    }
+    #[inline]
+    fn write_i32(&mut self, v: i32) {
+        self.add(v as u32 as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 use std::sync::Arc;
 
 use crate::parsers::ass::{AssScript, VALIGN_SUB};
@@ -51,13 +103,22 @@ pub struct Caches {
     units: HashMap<(usize, u32), Option<Arc<UnitGlyph>>>,
     sized: HashMap<(usize, u32, u64, u8), Option<SizedGlyph>>,
     drawings: HashMap<String, Option<(Arc<Outline>, Rect)>>,
+    /// Compiled shaping plans (see [`shape::PlanCache`]).
+    pub plans: shape::PlanCache,
     /// Border outlines by (glyph outline, stroker radii); the value keeps
     /// the source outline alive so its address stays unique.
-    strokes: HashMap<StrokeKey, (Arc<Outline>, Arc<Outline>)>,
+    strokes: HashMap<StrokeKey, CachedStroke>,
     /// Rasterized glyphs (libass bitmap cache), see [`BitmapKey`].
     bitmaps: HashMap<BitmapKey, CachedBitmap>,
     bitmap_bytes: usize,
     bitmap_budget: usize,
+    /// Finished runs (libass composite cache), see [`combine::CompositeKey`].
+    /// Its keys name outlines by address through [`BitmapKey`], so it is
+    /// emptied together with `bitmaps`, which keeps those outlines alive.
+    composites: HashMap<combine::CompositeKey, combine::CompositeValue>,
+    composite_bytes: usize,
+    /// Composite cache lookups, hits (`[subs/ass] perf`, benchmarks).
+    pub composite_lookups: (u64, u64),
 }
 
 /// A glyph bitmap under an affine transform: the outline (and, for a
@@ -67,6 +128,9 @@ pub struct Caches {
 /// glyph repeated across events, lines or `\move` frames rasterizes once
 /// per subpixel phase.
 pub type BitmapKey = (usize, usize, [u64; 4], i32, i32);
+
+/// The source outline (kept alive), its stroke and the stroke's control box.
+type CachedStroke = (Arc<Outline>, Arc<Outline>, Option<Rect>);
 
 /// A glyph outline (by address) and the stroker radii' bits.
 type StrokeKey = (usize, u64, u64);
@@ -112,13 +176,17 @@ impl Caches {
         Self {
             db,
             fonts: FontCache::default(),
-            units: HashMap::new(),
-            sized: HashMap::new(),
-            drawings: HashMap::new(),
-            strokes: HashMap::new(),
-            bitmaps: HashMap::new(),
+            units: HashMap::default(),
+            sized: HashMap::default(),
+            drawings: HashMap::default(),
+            plans: HashMap::default(),
+            strokes: HashMap::default(),
+            bitmaps: HashMap::default(),
             bitmap_bytes: 0,
             bitmap_budget,
+            composites: HashMap::default(),
+            composite_bytes: 0,
+            composite_lookups: (0, 0),
         }
     }
 
@@ -149,18 +217,20 @@ impl Caches {
         v
     }
 
-    /// `outline` stroked with radii `rx`/`ry` (glyph space, 26.6).
-    pub fn stroke(&mut self, outline: &Arc<Outline>, rx: f64, ry: f64) -> Arc<Outline> {
+    /// `outline` stroked with radii `rx`/`ry` (glyph space, 26.6), and the
+    /// stroke's control box.
+    pub fn stroke(&mut self, outline: &Arc<Outline>, rx: f64, ry: f64) -> (Arc<Outline>, Option<Rect>) {
         let key = (Arc::as_ptr(outline) as usize, rx.to_bits(), ry.to_bits());
-        if let Some((_, s)) = self.strokes.get(&key) {
-            return s.clone();
+        if let Some((_, s, cbox)) = self.strokes.get(&key) {
+            return (s.clone(), *cbox);
         }
         let s = Arc::new(outline::stroke(outline, rx, ry));
+        let cbox = s.cbox();
         if self.strokes.len() > 20_000 {
             self.strokes.clear();
         }
-        self.strokes.insert(key, (outline.clone(), s.clone()));
-        s
+        self.strokes.insert(key, (outline.clone(), s.clone(), cbox));
+        (s, cbox)
     }
 
     pub fn bitmap(&mut self, key: &BitmapKey) -> Option<Option<Arc<Bitmap>>> {
@@ -172,9 +242,30 @@ impl Caches {
         if self.bitmap_bytes + bytes > self.bitmap_budget {
             self.bitmaps.clear();
             self.bitmap_bytes = 0;
+            self.composites.clear();
+            self.composite_bytes = 0;
         }
         self.bitmap_bytes += bytes;
         self.bitmaps.insert(key, (outline.clone(), stroked.cloned(), bm));
+    }
+
+    pub fn composite(&mut self, key: &combine::CompositeKey) -> Option<combine::CompositeValue> {
+        let v = self.composites.get(key).cloned();
+        self.composite_lookups.0 += 1;
+        self.composite_lookups.1 += v.is_some() as u64;
+        v
+    }
+
+    pub fn put_composite(&mut self, key: combine::CompositeKey, value: combine::CompositeValue) {
+        let bytes = value.1.iter().flatten().map(|b| b.data.len()).sum::<usize>() + 64 * (key.len() + 1);
+        // Same budget as the glyph bitmaps; when it runs out the composites
+        // go first (they are rebuilt from cached glyphs cheaply).
+        if self.composite_bytes + bytes > self.bitmap_budget {
+            self.composites.clear();
+            self.composite_bytes = 0;
+        }
+        self.composite_bytes += bytes;
+        self.composites.insert(key, value);
     }
 
     pub fn drawing(&mut self, text: &str) -> Option<(Arc<Outline>, Rect)> {
@@ -266,7 +357,7 @@ impl AssRenderer {
             caches: Caches::new(db, BITMAP_CACHE_BYTES),
             lanes: Vec::new(),
             script: None,
-            fixed: HashMap::new(),
+            fixed: HashMap::default(),
             fixed_frame: (0, 0),
             added: std::collections::HashSet::new(),
         }
@@ -317,6 +408,11 @@ impl AssRenderer {
         self.caches = Caches::new(db, BITMAP_CACHE_BYTES / n);
         self.script = Some(ptr);
         self.fixed.clear();
+    }
+
+    /// Composite cache (lookups, hits) over all render threads.
+    pub fn composite_lookups(&self) -> (u64, u64) {
+        std::iter::once(&self.caches).chain(&self.lanes).fold((0, 0), |a, c| (a.0 + c.composite_lookups.0, a.1 + c.composite_lookups.1))
     }
 
     /// Forget where colliding events were placed (after a seek, a size
@@ -561,6 +657,121 @@ pub struct Composite {
 #[inline]
 fn div255(v: u32) -> u32 {
     (v + 1 + (v >> 8)) >> 8
+}
+
+/// A frame for the GPU to blend: every image's coverage mask packed into
+/// one 8-bit atlas, and a triangle list that draws them in paint order.
+/// What [`composite`] does per pixel on the CPU, left to the overlay's
+/// shader (one draw, a quarter of the upload).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Layers {
+    /// The images' bounding box on the frame, clipped to it (px).
+    pub left: i32,
+    pub top: i32,
+    pub width: u32,
+    pub height: u32,
+    /// `atlas_w`×`atlas_h` coverage, row-major; every mask has a zero
+    /// border so bilinear sampling never reaches a neighbour.
+    pub atlas: Vec<u8>,
+    pub atlas_w: u32,
+    pub atlas_h: u32,
+    /// [`LAYER_VERTEX_FLOATS`] per vertex, six vertices per image: position
+    /// in the bounding box (0..1, y down), atlas texture coordinate (0..1),
+    /// premultiplied linear RGBA (colour × opacity).
+    pub vertices: Vec<f32>,
+}
+
+/// Floats per [`Layers`] vertex: x, y, u, v, r, g, b, a.
+pub const LAYER_VERTEX_FLOATS: usize = 8;
+
+/// Atlas side limit: every GLES 3 device takes 2048, so does WebGL2.
+const ATLAS_MAX: u32 = 2048;
+
+/// `images` as [`Layers`] for the GPU; `None` when nothing is visible or
+/// the masks don't fit a [`ATLAS_MAX`]² atlas (then [`composite`] on the
+/// CPU).
+pub fn layers(images: &[Image], frame_w: i32, frame_h: i32) -> Option<Layers> {
+    // Each image's visible part (frame coordinates) and its colour.
+    struct Part {
+        img: usize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    }
+    let mut parts = Vec::with_capacity(images.len());
+    let (mut l, mut t, mut r, mut b) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for (i, img) in images.iter().enumerate() {
+        if img.color & 0xFF == 0xFF {
+            continue;
+        }
+        let (x0, y0) = (img.dst_x.max(0), img.dst_y.max(0));
+        let (x1, y1) = ((img.dst_x + img.w).min(frame_w), (img.dst_y + img.h).min(frame_h));
+        if x1 <= x0 || y1 <= y0 {
+            continue;
+        }
+        l = l.min(x0);
+        t = t.min(y0);
+        r = r.max(x1);
+        b = b.max(y1);
+        parts.push(Part { img: i, x: x0, y: y0, w: x1 - x0, h: y1 - y0 });
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    // Shelf packing, tallest first; one zero texel around every mask.
+    let area: u64 = parts.iter().map(|p| (p.w as u64 + 2) * (p.h as u64 + 2)).sum();
+    let widest = parts.iter().map(|p| p.w as u32 + 2).max().unwrap_or(1);
+    let atlas_w = ((area as f64).sqrt() * 1.15).ceil().max(widest as f64).min(ATLAS_MAX as f64) as u32;
+    if widest > atlas_w {
+        return None;
+    }
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(parts[i].h));
+    let mut slots = vec![(0u32, 0u32); parts.len()];
+    let (mut x, mut y, mut shelf) = (0u32, 0u32, 0u32);
+    for &i in &order {
+        let (w, h) = (parts[i].w as u32 + 2, parts[i].h as u32 + 2);
+        if x + w > atlas_w {
+            x = 0;
+            y += shelf;
+            shelf = 0;
+        }
+        slots[i] = (x + 1, y + 1);
+        x += w;
+        shelf = shelf.max(h);
+    }
+    let atlas_h = y + shelf;
+    if atlas_h > ATLAS_MAX {
+        return None;
+    }
+    let mut atlas = vec![0u8; (atlas_w * atlas_h) as usize];
+    let (bw, bh) = ((r - l) as f32, (b - t) as f32);
+    let (aw, ah) = (atlas_w as f32, atlas_h as f32);
+    let mut vertices = Vec::with_capacity(parts.len() * 6 * LAYER_VERTEX_FLOATS);
+    for (p, &(sx, sy)) in parts.iter().zip(&slots) {
+        let img = &images[p.img];
+        let stride = img.bitmap.w as usize;
+        // the visible part inside the image's bitmap
+        let (ix, iy) = (img.sx + p.x - img.dst_x, img.sy + p.y - img.dst_y);
+        for row in 0..p.h as usize {
+            let src = (iy as usize + row) * stride + ix as usize;
+            let dst = (sy as usize + row) * atlas_w as usize + sx as usize;
+            atlas[dst..dst + p.w as usize].copy_from_slice(&img.bitmap.data[src..src + p.w as usize]);
+        }
+        let opacity = (255 - (img.color & 0xFF)) as f32 / 255.0;
+        let c = |shift: u32| ((img.color >> shift) & 0xFF) as f32 / 255.0 * opacity;
+        let colour = [c(24), c(16), c(8), opacity];
+        let (x0, y0) = ((p.x - l) as f32 / bw, (p.y - t) as f32 / bh);
+        let (x1, y1) = ((p.x - l + p.w) as f32 / bw, (p.y - t + p.h) as f32 / bh);
+        let (u0, v0) = (sx as f32 / aw, sy as f32 / ah);
+        let (u1, v1) = ((sx + p.w as u32) as f32 / aw, (sy + p.h as u32) as f32 / ah);
+        for (vx, vy, vu, vv) in [(x0, y0, u0, v0), (x1, y0, u1, v0), (x0, y1, u0, v1), (x0, y1, u0, v1), (x1, y0, u1, v0), (x1, y1, u1, v1)] {
+            vertices.extend_from_slice(&[vx, vy, vu, vv]);
+            vertices.extend_from_slice(&colour);
+        }
+    }
+    Some(Layers { left: l, top: t, width: (r - l) as u32, height: (b - t) as u32, atlas, atlas_w, atlas_h, vertices })
 }
 
 /// Blend `images` in order (each: colour × coverage × (255 − alpha)) into

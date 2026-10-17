@@ -82,6 +82,13 @@ pub use parsers::vtt::VttCue;
 /// ASS/SSA scripts: what [`VttCue::ass`] links to, and what
 /// [`Player::add_external_subtitle_track`] parses `.ass` files into.
 pub use parsers::ass;
+/// The ASS renderer itself, for a shell that runs it somewhere else (the
+/// browser's render worker): the same code the overlay runs, and the frames
+/// it hands back.
+pub mod ass_render {
+    pub use crate::renderers::subtitle::ass::{composite, frame_for, layers, AssRenderer, Composite, Frame, Layers, LAYER_VERTEX_FLOATS};
+    pub use crate::renderers::subtitle::{AssOffload, AssRendered, AssRequest};
+}
 /// A font a manifest text track asks for (DVB font download descriptor).
 pub use manifest::FontDownload;
 

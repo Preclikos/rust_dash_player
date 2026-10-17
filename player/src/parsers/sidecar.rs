@@ -152,15 +152,8 @@ pub fn parse(
 
 fn parse_ass(body: &str, encoding: &'static str, time_offset_ms: i64) -> Result<ParsedSidecar, SidecarError> {
     let mut script = ass::parse(body).ok_or(SidecarError::NotSubtitleText)?;
-    // Shift the events themselves, not just the cues: an ASS renderer
-    // times `\t`, `\fad` and `\move` from the event's own start.
-    if time_offset_ms != 0 {
-        for e in &mut script.events {
-            let end = (e.end_ms() + time_offset_ms).max(0);
-            e.start_ms = (e.start_ms + time_offset_ms).max(0);
-            e.duration_ms = end - e.start_ms;
-        }
-    }
+    script.shift_events(time_offset_ms);
+    script.source = Some(ass::AssSource { text: body.into(), time_offset_ms });
     let script = Arc::new(script);
     let cues = ass::plain::to_cues(&script);
     if cues.is_empty() {

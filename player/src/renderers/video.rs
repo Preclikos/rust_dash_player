@@ -3344,6 +3344,10 @@ impl super::VideoSink for VideoRenderer {
         self.ensure_subtitle_overlay().add_ass_font(bytes)
     }
 
+    fn set_ass_offload(&self, offload: Arc<dyn super::subtitle::AssOffload>) {
+        self.ensure_subtitle_overlay().set_ass_offload(offload);
+    }
+
     fn set_subtitle_style(&self, style: crate::SubtitleStyle) {
         let overlay = self.ensure_subtitle_overlay();
         overlay.set_style(style);

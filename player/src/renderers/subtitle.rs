@@ -327,6 +327,66 @@ fn build_pipeline(
     })
 }
 
+/// The GPU side of ASS mask frames (see `SubtitleOverlay::draw_masks`).
+struct GpuMasks {
+    generation: u64,
+    cap_w: u32,
+    cap_h: u32,
+    /// Vertex buffer capacity, bytes.
+    vcap: u64,
+    #[allow(dead_code)]
+    texture: wgpu::Texture,
+    #[allow(dead_code)]
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+    vertices: wgpu::Buffer,
+    vertex_count: u32,
+    /// The atlas's share of the texture.
+    uv_scale: [f32; 2],
+    uniform: [f32; 8],
+}
+
+/// [`build_pipeline`] for mask frames: per-vertex position, atlas
+/// coordinate and premultiplied colour ([`ass::Layers::vertices`]).
+fn build_mask_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    format: wgpu::TextureFormat,
+    fs_entry: &'static str,
+) -> wgpu::RenderPipeline {
+    const ATTRS: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("subtitle_mask_pipeline"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_mask"),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: (ass::LAYER_VERTEX_FLOATS * 4) as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &ATTRS,
+            }],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(fs_entry),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct QuadUniform {
@@ -376,6 +436,54 @@ struct GpuCue {
 #[cfg_attr(target_os = "android", allow(dead_code))]
 pub const DIRECT_OVERLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
 
+/// Renders ASS frames off the draw thread for an overlay that has no worker
+/// thread of its own — the browser, where the page's one thread also
+/// decodes and presents the video. The browser shell implements it with a
+/// Web Worker running this same renderer (`bridge-web`); native overlays
+/// have their worker thread and never use it.
+///
+/// `done` must be called once per `render`, on the overlay's thread.
+pub trait AssOffload: Send + Sync {
+    /// False once it can't render any more (the worker failed to start):
+    /// frames are then rendered here again.
+    fn available(&self) -> bool {
+        true
+    }
+    /// Make a script available under `id` (its [`AssSource`]: text + time
+    /// shift). Called before the first `render` naming it.
+    fn load_script(&self, id: u64, source: &crate::parsers::ass::AssSource);
+    /// A font for every script (host / manifest font download).
+    fn add_font(&self, bytes: Arc<[u8]>);
+    fn render(&self, request: AssRequest, done: Box<dyn FnOnce(Option<AssRendered>) + Send>);
+}
+
+/// One frame to render ([`AssOffload::render`]).
+#[derive(Clone, Debug)]
+pub struct AssRequest {
+    pub script: u64,
+    /// Indices into the script's events.
+    pub events: Vec<u32>,
+    pub time_ms: i64,
+    pub frame: ass::Frame,
+    /// Forget where colliding events were placed first (after a seek).
+    pub relayout: bool,
+}
+
+/// A rendered frame: masks for the GPU, or flattened RGBA.
+pub enum AssRendered {
+    Masks(ass::Layers),
+    Rgba(ass::Composite),
+}
+
+/// The overlay's side of an [`AssOffload`].
+struct Offload {
+    target: Arc<dyn AssOffload>,
+    /// A frame is being rendered; the next one is cut when it is back.
+    busy: bool,
+    /// Script ids already loaded there.
+    loaded: Vec<u64>,
+}
+
 #[cfg_attr(target_os = "android", allow(dead_code))]
 pub struct SubtitleOverlay {
     device: Arc<wgpu::Device>,
@@ -398,6 +506,16 @@ pub struct SubtitleOverlay {
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     uniform_buffer: wgpu::Buffer,
+    /// ASS mask frames ([`ass::Layers`]): pipelines per target format
+    /// (surface, PQ, Apple direct), built on first use, and their own
+    /// uniform (the cue path caches what it last wrote to its own).
+    mask_pipelines: [std::sync::OnceLock<wgpu::RenderPipeline>; 3],
+    mask_uniform: wgpu::Buffer,
+    gpu_masks: Mutex<Option<GpuMasks>>,
+    /// See [`AssOffload`]; `None` = render here.
+    offload: Arc<Mutex<Option<Offload>>>,
+    /// Fonts added for ASS, replayed to an offload installed later.
+    ass_fonts: Mutex<Vec<Arc<[u8]>>>,
 
     /// Cue state + rasterizer output, shared with the worker thread.
     shared: Arc<Shared>,
@@ -446,6 +564,10 @@ struct Inner {
     ass_scale: f32,
     /// Bakes since `ass_scale` last changed.
     ass_scale_age: u32,
+    /// The last ASS frame was baked in the draw path (no worker thread, no
+    /// offload): it delays the video on that thread, so the render scale
+    /// steps down sooner.
+    ass_on_draw_thread: bool,
     /// fontdue::Font held behind an `Arc` so the render path can take a
     /// reference out of the lock for the price of a refcount bump.
     /// `fontdue::Font` is `Clone`, but that clone deep-copies every
@@ -611,17 +733,16 @@ impl Inner {
     /// a quarter of a frame.
     fn adapt_ass_scale(&mut self) {
         const MIN: f32 = 0.5;
-        const SLOW: f64 = if cfg!(target_arch = "wasm32") { 0.5 } else { 2.0 };
-        const FAST: f64 = if cfg!(target_arch = "wasm32") { 0.25 } else { 0.8 };
+        let (slow, fast) = if self.ass_on_draw_thread { (0.5, 0.25) } else { (2.0, 0.8) };
         self.ass_scale_age += 1;
         if self.ass_scale_age < 6 {
             return;
         }
         let frame = if self.frame_ms > 0.0 { self.frame_ms } else { ASS_TICK_MS as f64 };
         let old = self.ass_scale;
-        if self.ass_bake_ms > SLOW * frame && self.ass_scale > MIN {
+        if self.ass_bake_ms > slow * frame && self.ass_scale > MIN {
             self.ass_scale = (self.ass_scale * 0.85).max(MIN);
-        } else if self.ass_bake_ms < FAST * frame && self.ass_scale < 1.0 {
+        } else if self.ass_bake_ms < fast * frame && self.ass_scale < 1.0 {
             self.ass_scale = (self.ass_scale / 0.9).min(1.0);
         }
         if self.ass_scale != old {
@@ -885,6 +1006,9 @@ pub struct SubtitleBitmap {
     /// Picture px per bitmap px: an ASS frame rendered at reduced
     /// resolution (see `Inner::ass_scale`) is drawn this much larger.
     pub scale: f32,
+    /// An ASS frame left for the GPU to blend ([`ass::Layers`]): then
+    /// `rgba` is empty and `width`×`height` is the frame's bounding box.
+    pub masks: Option<Arc<ass::Layers>>,
     /// Identity for cache validation: same text + same settings at about
     /// the same parent width = same bitmap.
     text: String,
@@ -953,6 +1077,10 @@ struct AssPerf {
     held: u32,
     missing: u32,
     min_scale: f32,
+    /// Composite cache (lookups, hits): totals at the last bake and at
+    /// the start of the period.
+    cc: (u64, u64),
+    cc_start: (u64, u64),
 }
 
 const ASS_PERF_ZERO: AssPerf = AssPerf {
@@ -968,6 +1096,8 @@ const ASS_PERF_ZERO: AssPerf = AssPerf {
     held: 0,
     missing: 0,
     min_scale: 1.0,
+    cc: (0, 0),
+    cc_start: (0, 0),
 };
 
 static ASS_PERF: Mutex<AssPerf> = Mutex::new(ASS_PERF_ZERO);
@@ -982,7 +1112,7 @@ fn ass_perf(f: impl FnOnce(&mut AssPerf)) {
     }
     let n = p.frames.max(1) as f64;
     log::info!(
-        "[subs/ass] perf {:.1}s: {} frames baked, render avg {:.1} max {:.1} ms, composite avg {:.1} ms, peak {} events / {} images / {:.2} Mpx | draws exact {} held {} missing {} | scale {:.2}",
+        "[subs/ass] perf {:.1}s: {} frames baked, render avg {:.1} max {:.1} ms, composite avg {:.1} ms, peak {} events / {} images / {:.2} Mpx | draws exact {} held {} missing {} | scale {:.2} | composite cache {:.0}% of {} runs",
         now.duration_since(since).as_secs_f64(),
         p.frames,
         p.render_ms / n,
@@ -994,9 +1124,11 @@ fn ass_perf(f: impl FnOnce(&mut AssPerf)) {
         p.exact,
         p.held,
         p.missing,
-        p.min_scale
+        p.min_scale,
+        (p.cc.1 - p.cc_start.1) as f64 / (p.cc.0 - p.cc_start.0).max(1) as f64 * 100.0,
+        p.cc.0 - p.cc_start.0
     );
-    *p = AssPerf { since: Some(now), ..ASS_PERF_ZERO };
+    *p = AssPerf { since: Some(now), cc: p.cc, cc_start: p.cc, ..ASS_PERF_ZERO };
 }
 
 /// The ASS track the cues belong to.
@@ -1092,6 +1224,7 @@ impl SubtitleOverlay {
                 ass_bake_ms: 0.0,
                 ass_scale: 1.0,
                 ass_scale_age: 0,
+                ass_on_draw_thread: false,
                 font: rasterizer::default_font().map(Arc::new),
                 fallback: rasterizer::fallback_font().map(Arc::new),
                 style: SubtitleStyle::DEFAULT,
@@ -1113,6 +1246,13 @@ impl SubtitleOverlay {
                 video_h: 0,
             }),
             wake: std::sync::Condvar::new(),
+        });
+
+        let mask_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("subtitle_mask_uniform"),
+            size: std::mem::size_of::<QuadUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let worker = {
@@ -1148,6 +1288,11 @@ impl SubtitleOverlay {
             bind_group_layout,
             sampler,
             uniform_buffer,
+            mask_pipelines: Default::default(),
+            mask_uniform,
+            gpu_masks: Mutex::new(None),
+            offload: Arc::new(Mutex::new(None)),
+            ass_fonts: Mutex::new(Vec::new()),
             shared,
             gpu: Mutex::new(None),
             worker,
@@ -1184,6 +1329,11 @@ impl SubtitleOverlay {
     /// Add a font for ASS rendering (see `AssRenderer::add_font`). The
     /// frames on screen are re-rendered with it.
     pub fn add_ass_font(&self, bytes: Vec<u8>) -> usize {
+        let shared: Arc<[u8]> = bytes.as_slice().into();
+        self.ass_fonts.lock().unwrap().push(Arc::clone(&shared));
+        if let Some(off) = self.offload.lock().unwrap().as_ref() {
+            off.target.add_font(shared);
+        }
         let renderer = Arc::clone(&self.shared.inner.lock().unwrap().ass_renderer);
         let n = renderer.lock().unwrap().add_font(bytes);
         if n > 0 {
@@ -1362,6 +1512,10 @@ impl SubtitleOverlay {
         // Same geometry as the GLES path: `cue_quad` is the one place that
         // turns cue settings + parent rect into a quad.
         let transform = cue_quad(&bitmap, parent);
+        if let Some(masks) = &bitmap.masks {
+            self.draw_masks(render_pass, bitmap.generation, masks, transform);
+            return;
+        }
 
         let mut gpu = self.gpu.lock().unwrap();
         // Upload only when the content changed, into the one reused texture
@@ -1431,6 +1585,99 @@ impl SubtitleOverlay {
         render_pass.draw(0..6, 0..1);
         // suppress unused-warning on surface_format
         let _ = self.surface_format;
+    }
+
+    /// An ASS frame as masks: the atlas into the (grow-only) R8 texture and
+    /// the vertices into the (grow-only) vertex buffer when the frame
+    /// changed, then one draw blends every image in paint order.
+    fn draw_masks(&self, render_pass: &mut wgpu::RenderPass<'_>, generation: u64, masks: &ass::Layers, transform: [f32; 4]) {
+        let mut gpu = self.gpu_masks.lock().unwrap();
+        let vbytes = (masks.vertices.len() * 4) as u64;
+        let stale = gpu.as_ref().is_none_or(|g| g.generation != generation);
+        if stale {
+            let fits = gpu.as_ref().is_some_and(|g| g.cap_w >= masks.atlas_w && g.cap_h >= masks.atlas_h && g.vcap >= vbytes);
+            if !fits {
+                let (ow, oh, ov) = gpu.as_ref().map_or((0, 0, 0), |g| (g.cap_w, g.cap_h, g.vcap));
+                let max = self.device.limits().max_texture_dimension_2d;
+                let cap_w = masks.atlas_w.max(ow).next_multiple_of(256).min(max);
+                let cap_h = masks.atlas_h.max(oh).next_multiple_of(64).min(max);
+                let vcap = vbytes.max(ov).next_power_of_two().max(4096);
+                *gpu = Some(self.create_gpu_masks(cap_w, cap_h, vcap));
+            }
+            let g = gpu.as_mut().expect("just created");
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &masks.atlas,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(masks.atlas_w), rows_per_image: Some(masks.atlas_h) },
+                wgpu::Extent3d { width: masks.atlas_w, height: masks.atlas_h, depth_or_array_layers: 1 },
+            );
+            self.queue.write_buffer(&g.vertices, 0, bytemuck::cast_slice(&masks.vertices));
+            g.generation = generation;
+            g.vertex_count = (masks.vertices.len() / ass::LAYER_VERTEX_FLOATS) as u32;
+            g.uv_scale = [masks.atlas_w as f32 / g.cap_w as f32, masks.atlas_h as f32 / g.cap_h as f32];
+        }
+        let g = gpu.as_mut().expect("populated above");
+        let uniform = [transform[0], transform[1], transform[2], transform[3], g.uv_scale[0], g.uv_scale[1], 0.0, 0.0];
+        if g.uniform != uniform {
+            let uv_scale = [g.uv_scale[0], g.uv_scale[1], 0.0, 0.0];
+            self.queue.write_buffer(&self.mask_uniform, 0, bytemuck::cast_slice(&[QuadUniform { transform, uv_scale }]));
+            g.uniform = uniform;
+        }
+        let (slot, format, fs) = if self.direct_output.load(std::sync::atomic::Ordering::Relaxed) {
+            (2, DIRECT_OVERLAY_FORMAT, "fs_mask")
+        } else if self.pq_output.load(std::sync::atomic::Ordering::Relaxed) {
+            (1, wgpu::TextureFormat::Rgba16Float, "fs_mask_pq")
+        } else {
+            (0, self.surface_format, "fs_mask")
+        };
+        let pipeline = self.mask_pipelines[slot].get_or_init(|| build_mask_pipeline(&self.device, &self.shader, &self.pipeline_layout, format, fs));
+        render_pass.set_pipeline(pipeline);
+        render_pass.set_bind_group(0, &g.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, g.vertices.slice(..));
+        render_pass.draw(0..g.vertex_count, 0..1);
+    }
+
+    fn create_gpu_masks(&self, cap_w: u32, cap_h: u32, vcap: u64) -> GpuMasks {
+        self.texture_allocs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("subtitle_mask_atlas"),
+            size: wgpu::Extent3d { width: cap_w, height: cap_h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("subtitle_mask_bind_group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.mask_uniform.as_entire_binding() },
+            ],
+        });
+        let vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("subtitle_mask_vertices"),
+            size: vcap,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        GpuMasks {
+            generation: 0,
+            cap_w,
+            cap_h,
+            vcap,
+            texture,
+            view,
+            bind_group,
+            vertices,
+            vertex_count: 0,
+            uv_scale: [1.0, 1.0],
+            uniform: [f32::NAN; 8],
+        }
     }
 
     /// HDR output session on/off: cues are then drawn PQ-encoded into an
@@ -1549,11 +1796,104 @@ impl SubtitleOverlay {
             job
         };
         let Some(job) = job else { return };
+        if job.ass.is_some() && self.offload_job(&job) {
+            return;
+        }
         let started = crate::rt::Instant::now();
         let rasterized = bake(&job);
         let bake_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut inner = self.shared.inner.lock().unwrap();
+        // baked right here, in the draw path (see `adapt_ass_scale`)
+        inner.ass_on_draw_thread = job.ass.is_some();
         inner.store_baked(job, rasterized, bake_ms);
+    }
+
+    /// Render ASS frames through `target` from now on (see [`AssOffload`]).
+    /// Fonts added so far are handed over first.
+    pub fn set_ass_offload(&self, target: Arc<dyn AssOffload>) {
+        for f in self.ass_fonts.lock().unwrap().iter() {
+            target.add_font(Arc::clone(f));
+        }
+        *self.offload.lock().unwrap() = Some(Offload { target, busy: false, loaded: Vec::new() });
+    }
+
+    /// Send an ASS job to the offload; false when there is none or the
+    /// script can't go there (then it is baked here). While one is out,
+    /// later jobs are simply not cut — the next draw asks again.
+    fn offload_job(&self, job: &RasterJob) -> bool {
+        let a = job.ass.as_ref().expect("an ASS job");
+        let mut slot = self.offload.lock().unwrap();
+        let Some(off) = slot.as_mut() else { return false };
+        let Some(source) = a.script.source.as_ref() else { return false };
+        if !off.target.available() {
+            return false;
+        }
+        if off.busy {
+            return true;
+        }
+        let id = Arc::as_ptr(&a.script) as usize as u64;
+        if !off.loaded.contains(&id) {
+            off.target.load_script(id, source);
+            off.loaded.push(id);
+        }
+        off.busy = true;
+        let request = AssRequest {
+            script: id,
+            events: a.show.key.events.iter().map(|&e| e as u32).collect(),
+            time_ms: a.show.time_ms,
+            frame: a.frame,
+            relayout: a.relayout,
+        };
+        let job = RasterJob {
+            fonts: job.fonts.clone(),
+            text: String::new(),
+            layout: job.layout,
+            style: job.style,
+            target_w: job.target_w,
+            type_h: job.type_h,
+            epoch: job.epoch,
+            ass: Some(AssJob {
+                script: Arc::clone(&a.script),
+                show: a.show.clone(),
+                renderer: Arc::clone(&a.renderer),
+                frame: a.frame,
+                relayout: a.relayout,
+                scale: a.scale,
+                brief: a.brief,
+            }),
+        };
+        let (shared, offload) = (Arc::clone(&self.shared), Arc::clone(&self.offload));
+        let started = crate::rt::Instant::now();
+        let target = Arc::clone(&off.target);
+        drop(slot);
+        target.render(
+            request,
+            Box::new(move |rendered| {
+                let bake_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let frame = match rendered {
+                    Some(AssRendered::Masks(l)) => AssFrame::Masks(l),
+                    Some(AssRendered::Rgba(c)) => AssFrame::Rgba(c),
+                    None => AssFrame::Empty,
+                };
+                let (events, px) = (job.ass.as_ref().map_or(0, |a| a.show.key.events.len()), frame.pixels());
+                ass_perf(|p| {
+                    p.frames += 1;
+                    p.render_ms += bake_ms;
+                    p.render_max_ms = p.render_max_ms.max(bake_ms);
+                    p.max_events = p.max_events.max(events);
+                    p.max_px = p.max_px.max(px);
+                });
+                {
+                    let mut inner = shared.inner.lock().unwrap();
+                    inner.ass_on_draw_thread = false;
+                    inner.store_baked(job, Baked::Ass(frame), bake_ms);
+                }
+                if let Some(off) = offload.lock().unwrap().as_mut() {
+                    off.busy = false;
+                }
+            }),
+        );
+        true
     }
 }
 
@@ -1685,7 +2025,25 @@ struct AssJob {
 /// A job's output.
 enum Baked {
     Text(Option<rasterizer::CueRaster>),
-    Ass(Option<ass::Composite>),
+    Ass(AssFrame),
+}
+
+/// A baked ASS frame: masks for the GPU, or (atlas too large) the frame
+/// flattened on the CPU.
+enum AssFrame {
+    Empty,
+    Masks(ass::Layers),
+    Rgba(ass::Composite),
+}
+
+impl AssFrame {
+    fn pixels(&self) -> u64 {
+        match self {
+            AssFrame::Empty => 0,
+            AssFrame::Masks(l) => l.width as u64 * l.height as u64,
+            AssFrame::Rgba(c) => c.width as u64 * c.height as u64,
+        }
+    }
 }
 
 /// Do the expensive part of a job (no lock held).
@@ -1702,7 +2060,10 @@ fn bake(job: &RasterJob) -> Baked {
             let started = crate::rt::Instant::now();
             let imgs = r.render(&a.script, &a.show.key.events, a.show.time_ms, a.frame);
             let rendered = crate::rt::Instant::now();
-            let out = ass::composite(&imgs, a.frame.width, a.frame.height);
+            let out = match ass::layers(&imgs, a.frame.width, a.frame.height) {
+                Some(l) => AssFrame::Masks(l),
+                None => ass::composite(&imgs, a.frame.width, a.frame.height).map_or(AssFrame::Empty, AssFrame::Rgba),
+            };
             let render_ms = rendered.duration_since(started).as_secs_f64() * 1000.0;
             let composite_ms = rendered.elapsed().as_secs_f64() * 1000.0;
             log::trace!(
@@ -1712,7 +2073,7 @@ fn bake(job: &RasterJob) -> Baked {
                 render_ms,
                 composite_ms
             );
-            let px = out.as_ref().map_or(0, |c| c.width as u64 * c.height as u64);
+            let px = out.pixels();
             ass_perf(|p| {
                 p.frames += 1;
                 p.render_ms += render_ms;
@@ -1722,6 +2083,12 @@ fn bake(job: &RasterJob) -> Baked {
                 p.max_images = p.max_images.max(imgs.len());
                 p.max_px = p.max_px.max(px);
                 p.min_scale = p.min_scale.min(a.scale);
+                // a new renderer (track switch) starts its counters at 0
+                let cc = r.composite_lookups();
+                if cc.0 < p.cc.0 {
+                    p.cc_start = (0, 0);
+                }
+                p.cc = cc;
             });
             Baked::Ass(out)
         }
@@ -1814,9 +2181,11 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
                 Some(a) => (Some(a.show.key), a.show.time_ms, 1.0 / a.scale),
                 None => (None, 0, 1.0),
             };
-            let (width, height, rgba, origin) = match c {
-                Some(c) => (c.width, c.height, c.rgba, Some((c.left as f32 * ass_scale, c.top as f32 * ass_scale))),
-                None => (0, 0, Vec::new(), None),
+            let at = |l: i32, t: i32| Some((l as f32 * ass_scale, t as f32 * ass_scale));
+            let (width, height, rgba, origin, masks) = match c {
+                AssFrame::Masks(l) => (l.width, l.height, Vec::new(), at(l.left, l.top), Some(Arc::new(l))),
+                AssFrame::Rgba(c) => (c.width, c.height, c.rgba, at(c.left, c.top), None),
+                AssFrame::Empty => (0, 0, Vec::new(), None, None),
             };
             return SubtitleBitmap {
                 rgba,
@@ -1827,6 +2196,7 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
                 layout: CueLayout::DEFAULT,
                 origin,
                 scale: ass_scale,
+                masks,
                 text: String::new(),
                 target_w: job.target_w,
                 ass_key: key,
@@ -1847,6 +2217,7 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
         layout: job.layout,
         origin: None,
         scale: 1.0,
+        masks: None,
         text: job.text,
         target_w: job.target_w,
         ass_key: None,
@@ -1886,6 +2257,7 @@ mod tests {
             ass_bake_ms: 0.0,
             ass_scale: 1.0,
             ass_scale_age: 0,
+            ass_on_draw_thread: false,
             font: None,
             fallback: None,
             style: SubtitleStyle::DEFAULT,
@@ -2014,6 +2386,7 @@ mod tests {
             layout: CueLayout::DEFAULT,
             origin: None,
             scale: 1.0,
+            masks: None,
             text: "first".to_string(),
             target_w: 1920,
             ass_key: None,
@@ -2194,6 +2567,7 @@ mod tests {
             layout: CueLayout::parse(settings),
             origin: None,
             scale: 1.0,
+            masks: None,
             text: String::new(),
             target_w: 0,
             ass_key: None,
@@ -2589,6 +2963,49 @@ mod gpu_tests {
     }
 
     #[test]
+    fn gpu_mask_frames_match_the_cpu_composite() {
+        let Some((dev, queue)) = device() else {
+            eprintln!("SKIP: no GPU adapter");
+            return;
+        };
+        // Borders, shadows, transparency, a karaoke split (two colours from
+        // one bitmap), blur, and images overlapping each other.
+        let events = "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an5\\pos(320,150)\\bord3\\shad4\\3c&H0000FF&\\4a&H60&}{\\kf80}Karaoke {\\kf120}sweep\n\
+                      Dialogue: 1,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an5\\pos(330,160)\\1a&H80&\\blur2\\c&H00FF00&\\fs60}Overlap\n\
+                      Dialogue: 2,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\an7\\pos(40,240)\\1c&HFF8000&\\1a&H40&\\p1}m 0 0 l 200 0 200 80 0 80\n";
+        let cues = ass_cues(events);
+        let script = cues.iter().find_map(|c| c.ass.as_ref().map(|a| Arc::clone(&a.script))).unwrap();
+        let overlay = SubtitleOverlay::new(Arc::clone(&dev), Arc::clone(&queue), wgpu::TextureFormat::Rgba8Unorm);
+        let target = target(&dev);
+        overlay.queue_cues(cues);
+        overlay.set_pts_ms(1000);
+        let px = wait_frame(&dev, &queue, &overlay, &target, |p| changed(p).is_some());
+        assert!(overlay.shared.inner.lock().unwrap().ready.iter().any(|b| b.masks.is_some()), "drawn as masks");
+
+        // The same frame flattened on the CPU, over the same grey.
+        let frame = ass::frame_for(&script, W, H, None, SubtitleStyle::DEFAULT.size_scale as f64);
+        let imgs = ass::AssRenderer::new().render(&script, &[0, 1, 2], 1000, frame);
+        let c = ass::composite(&imgs, W as i32, H as i32).unwrap();
+        let mut want = vec![0u8; (W * H * 4) as usize];
+        for (i, p) in want.chunks_mut(4).enumerate() {
+            let (x, y) = (i as i32 % W as i32 - c.left, i as i32 / W as i32 - c.top);
+            let s = if (0..c.width as i32).contains(&x) && (0..c.height as i32).contains(&y) {
+                &c.rgba[((y * c.width as i32 + x) * 4) as usize..][..4]
+            } else {
+                &[0, 0, 0, 0][..]
+            };
+            for k in 0..3 {
+                p[k] = (s[k] as f32 + BG[k] as f32 * (1.0 - s[3] as f32 / 255.0)).round() as u8;
+            }
+            p[3] = 255;
+        }
+        let worst = px.iter().zip(&want).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        let inked = want.chunks(4).filter(|p| p[..3] != BG[..3]).count();
+        assert!(inked > 10_000, "the frame has ink ({inked} px)");
+        assert!(worst <= 3, "GPU blend differs from the CPU composite by {worst}");
+    }
+
+    #[test]
     fn a_typeset_script_keeps_every_event() {
         // Frame-by-frame typesetting: one event per sign per 42 ms frame.
         let events: String = (0..12_000)
@@ -2692,6 +3109,7 @@ mod gpu_tests {
                 layout: CueLayout::DEFAULT,
                 origin: Some((0.0, 0.0)),
                 scale: 1.0,
+                masks: None,
                 text: String::new(),
                 target_w: 1920,
                 ass_key: Some(show.key),

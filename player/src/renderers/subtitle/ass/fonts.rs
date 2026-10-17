@@ -21,7 +21,7 @@
 //! script's `[Fonts]` and whatever the host added. The fallback is the
 //! built-in Roboto/DejaVu, and as a last resort any face that has the glyph.
 
-use std::collections::HashMap;
+use super::HashMap;
 use std::sync::Arc;
 
 use skrifa::raw::{FileRef, FontRef, TableProvider};

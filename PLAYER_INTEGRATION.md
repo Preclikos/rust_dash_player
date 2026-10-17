@@ -578,10 +578,14 @@ keeps its cores. Frames render at most 1920×1080 (a 4K picture gets a
 1080p frame drawn larger), and while animation frames take more than two
 video frames to render, their resolution drops step by step to half and
 climbs back when there is time — on a weak TV stick signs get softer, not
-slower. Lines that stay up are always rendered at full resolution.
+slower. Lines that stay up are always rendered at full resolution. The
+GPU does the final blend: a frame reaches the overlay as 8-bit coverage
+masks in one atlas plus a triangle list, not as an RGBA picture. In the
+browser the frames render in a Web Worker (same renderer, see
+`platform/web/README.md`), so the page's thread only draws them.
 `[subs/ass] perf` (info, every 5 s while ASS is on screen) reports render
-times, frame size, the render scale, and how many draws had their own
-frame (`exact`), a held one or none.
+times, frame size, the render scale, how many draws had their own frame
+(`exact`), a held one or none, and the composite cache hit rate.
 
 **From a manifest.** A text AdaptationSet with `codecs="ass"` (or
 `mimeType="text/x-ssa"`) and one file in `BaseURL`:
@@ -596,6 +600,8 @@ frame (`exact`), a held one or none.
   <Representation id="sub-cs" bandwidth="1000"><BaseURL>subs/cs.ass</BaseURL></Representation>
 </AdaptationSet>
 ```
+
+A complete, commented manifest: `docs/examples/ass-reference.mpd`.
 
 The fonts (DVB-DASH font download, ETSI TS 103 285 §7.2 — any number per
 track, URLs relative to the MPD's base) are fetched when the track is

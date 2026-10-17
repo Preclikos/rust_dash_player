@@ -399,7 +399,7 @@ pub fn shape(glyphs: &mut [Glyph], st: &State<'_>, caches: &mut Caches) {
             kerning: st.script.kerning,
             ligatures: glyphs[offset].hspacing == 0.0,
         };
-        let shaped = shape_run(&face, glyphs[offset].font_size, &text, &opts);
+        let shaped = shape_run(&face, glyphs[offset].font_size, &text, &opts, Some((face_id, &mut caches.plans)));
         for s in shaped {
             let idx = offset + s.cluster;
             let info = &mut glyphs[idx];

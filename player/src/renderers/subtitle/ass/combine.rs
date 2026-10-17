@@ -15,7 +15,7 @@ use super::bitmap::{self, Bitmap};
 use super::context::{apply_fade, d6, from_d6, lrint, Effect, State};
 use super::layout::{Glyph, Part, Text};
 use super::outline::{self, Outline, P};
-use super::Caches;
+use super::{BitmapKey, Caches};
 
 const F_BORDER_STYLE_3: u32 = 1;
 const F_NONZERO_BORDER: u32 = 2;
@@ -52,6 +52,59 @@ impl Image {
     }
 }
 
+/// A glyph's fill or border bitmap where it lands: a shared bitmap (often
+/// the bitmap cache's) moved by `(dx, dy)` px, and its cache key when it
+/// has one (what the composite cache matches runs by).
+#[derive(Clone)]
+struct Piece {
+    bm: Arc<Bitmap>,
+    dx: i32,
+    dy: i32,
+    key: Option<BitmapKey>,
+}
+
+impl Piece {
+    fn loose(bm: Option<Bitmap>) -> Option<Piece> {
+        bm.map(|b| Piece { bm: Arc::new(b), dx: 0, dy: 0, key: None })
+    }
+
+    fn left(&self) -> i32 {
+        self.bm.left + self.dx
+    }
+
+    fn top(&self) -> i32 {
+        self.bm.top + self.dy
+    }
+}
+
+/// A run's finished bitmap and where it is drawn: `bm` moved by the
+/// offset (non-zero when it came out of the composite cache).
+type Placed = (Arc<Bitmap>, (i32, i32));
+
+/// libass composite cache key (`CompositeHashKey`): the run's pieces by
+/// bitmap key and position relative to the first one, and everything the
+/// composite does to them.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct CompositeKey {
+    glyphs: Vec<(BitmapKey, i32, i32)>,
+    borders: Vec<(BitmapKey, i32, i32)>,
+    be: i32,
+    blur: (i32, i32),
+    shadow: (i32, i32),
+    flags: u32,
+}
+
+impl CompositeKey {
+    /// Pieces in the key (its memory weight).
+    pub fn len(&self) -> usize {
+        self.glyphs.len() + self.borders.len()
+    }
+}
+
+/// The composite cache's value: the anchor (first piece's position) the
+/// bitmaps were made at, and the fill, border and shadow bitmaps.
+pub type CompositeValue = ((i32, i32), [Option<Arc<Bitmap>>; 3]);
+
 /// libass `CombinedBitmapInfo`.
 struct Combined {
     flags: u32,
@@ -68,11 +121,11 @@ struct Combined {
     spread: Option<(f64, f64)>,
     /// Subpixel residual of the run's first glyph (see `snap`).
     residual: Option<(f64, f64)>,
-    glyphs: Vec<Bitmap>,
-    borders: Vec<Bitmap>,
-    bm: Option<Arc<Bitmap>>,
-    bm_o: Option<Arc<Bitmap>>,
-    bm_s: Option<Arc<Bitmap>>,
+    glyphs: Vec<Piece>,
+    borders: Vec<Piece>,
+    bm: Option<Placed>,
+    bm_o: Option<Placed>,
+    bm_s: Option<Placed>,
 }
 
 /// C `frexp` exponent.
@@ -163,8 +216,8 @@ fn with_scale(m1: &[[f64; 3]; 3], scale: (f64, f64), offset: (f64, f64)) -> [[f6
 
 /// Behind the viewer (libass `quantize_transform` rejects `m_zz ≤ 0` at
 /// the outline's centre).
-fn visible(m: &[[f64; 3]; 3], o: &Outline) -> bool {
-    let c = o.cbox().unwrap_or(outline::Rect { x_min: 0.0, y_min: 0.0, x_max: 0.0, y_max: 0.0 });
+fn visible(m: &[[f64; 3]; 3], cbox: Option<outline::Rect>) -> bool {
+    let c = cbox.unwrap_or(outline::Rect { x_min: 0.0, y_min: 0.0, x_max: 0.0, y_max: 0.0 });
     let (x0, y0) = ((c.x_min + c.x_max) / 2.0, (c.y_min + c.y_max) / 2.0);
     m[2][0] * x0 + m[2][1] * y0 + m[2][2] > 0.0
 }
@@ -174,9 +227,9 @@ fn visible(m: &[[f64; 3]; 3], o: &Outline) -> bool {
 /// run's first residual, so the glyphs of a run keep their spacing and the
 /// run as a whole snaps. Returns the shift to apply (26.6); `first` records
 /// the residual.
-fn snap(m: &[[f64; 3]; 3], o: &Outline, residual: &mut Option<(f64, f64)>, first: bool) -> Option<(f64, f64)> {
+fn snap(m: &[[f64; 3]; 3], cbox: Option<outline::Rect>, residual: &mut Option<(f64, f64)>, first: bool) -> Option<(f64, f64)> {
     // An empty outline (a space) has a zero control box in libass.
-    let c = o.cbox().unwrap_or(outline::Rect { x_min: 0.0, y_min: 0.0, x_max: 0.0, y_max: 0.0 });
+    let c = cbox.unwrap_or(outline::Rect { x_min: 0.0, y_min: 0.0, x_max: 0.0, y_max: 0.0 });
     let (x0, y0) = ((c.x_min + c.x_max) / 2.0, (c.y_min + c.y_max) / 2.0);
     let z = m[2][0] * x0 + m[2][1] * y0 + m[2][2];
     if z <= 0.0 {
@@ -199,11 +252,11 @@ fn snap(m: &[[f64; 3]; 3], o: &Outline, residual: &mut Option<(f64, f64)>, first
 /// too; skipping them changes nothing on screen and keeps an event that
 /// runs far off the frame (a page of text, a long `\move`) from
 /// rasterizing all of it. Affine transforms only.
-fn off_frame(st: &State<'_>, m: &[[f64; 3]; 3], o: &Outline, shift: (f64, f64), bord: (f64, f64), spread: (f64, f64)) -> bool {
+fn off_frame(st: &State<'_>, m: &[[f64; 3]; 3], cbox: Option<outline::Rect>, shift: (f64, f64), bord: (f64, f64), spread: (f64, f64)) -> bool {
     if m[2][0] != 0.0 || m[2][1] != 0.0 || m[2][2] <= 0.0 {
         return false;
     }
-    let Some(c) = o.cbox() else { return true };
+    let Some(c) = cbox else { return true };
     let w = 1.0 / m[2][2];
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for (x, y) in [(c.x_min, c.y_min), (c.x_max, c.y_min), (c.x_min, c.y_max), (c.x_max, c.y_max)] {
@@ -234,7 +287,7 @@ fn raster(
     stroked: Option<&Arc<Outline>>,
     m: &[[f64; 3]; 3],
     shift: (f64, f64),
-) -> Option<Bitmap> {
+) -> Option<Piece> {
     let draw = |m: &[[f64; 3]; 3], shift: (f64, f64)| {
         let fill = bitmap::fill(&placed(outline, m, shift));
         match stroked {
@@ -243,7 +296,7 @@ fn raster(
         }
     };
     if m[2][0] != 0.0 || m[2][1] != 0.0 || m[2][2] < 0.1 {
-        return draw(m, shift);
+        return Piece::loose(draw(m, shift));
     }
     let w = 1.0 / m[2][2];
     let lin = [m[0][0] * w, m[0][1] * w, m[1][0] * w, m[1][1] * w];
@@ -266,10 +319,7 @@ fn raster(
             bm
         }
     }?;
-    let mut out = (*bm).clone();
-    out.left += ix as i32;
-    out.top += iy as i32;
-    Some(out)
+    Some(Piece { bm, dx: ix as i32, dy: iy as i32, key: Some(key) })
 }
 
 /// libass `get_bitmap_glyph`: the part's fill and border bitmaps.
@@ -283,7 +333,7 @@ fn glyph_bitmaps(
     spread: Option<(f64, f64)>,
     leftmost_x: &mut f64,
     residual: &mut Option<(f64, f64)>,
-) -> (Option<Bitmap>, Option<Bitmap>) {
+) -> (Option<Piece>, Option<Piece>) {
     let Some(outline) = &p.outline else { return (None, None) };
     if g.symbol == '\n' as u32 || g.symbol == 0 || g.skip {
         return (None, None);
@@ -295,18 +345,20 @@ fn glyph_bitmaps(
             *leftmost_x = leftmost_x.min(x);
         }
     }
-    if !visible(&m2, outline) {
+    // one pass over the outline's points for all three
+    let cbox = outline.cbox();
+    if !visible(&m2, cbox) {
         return (None, None);
     }
     let first = residual.is_none();
-    let Some(shift) = snap(&m2, outline, residual, first) else { return (None, None) };
+    let Some(shift) = snap(&m2, cbox, residual, first) else { return (None, None) };
     if let Some(spread) = spread {
         let bord = if flags & F_NONZERO_BORDER != 0 {
             (64.0 * st.border_scale_x * g.border_x / p.scale.0 / st.frame.par, 64.0 * st.border_scale_y * g.border_y / p.scale.1)
         } else {
             (0.0, 0.0)
         };
-        if off_frame(st, &m2, outline, shift, (bord.0.abs(), bord.1.abs()), spread) {
+        if off_frame(st, &m2, cbox, shift, (bord.0.abs(), bord.1.abs()), spread) {
             return (None, None);
         }
     }
@@ -335,8 +387,8 @@ fn glyph_bitmaps(
         let m = with_scale(&m1, scale, offset);
         let mut boxo = Outline::default();
         boxo.add_rect(0.0, 0.0, 64.0, 64.0, true);
-        let shift = snap(&m, &boxo, residual, false).unwrap_or(shift);
-        let bo = bitmap::fill(&placed(&boxo, &m, shift));
+        let shift = snap(&m, boxo.cbox(), residual, false).unwrap_or(shift);
+        let bo = Piece::loose(bitmap::fill(&placed(&boxo, &m, shift)));
         return (bm, bo);
     }
     if flags & F_NONZERO_BORDER == 0 {
@@ -351,31 +403,55 @@ fn glyph_bitmaps(
     if px_x < 1.0 / 128.0 && px_y < 1.0 / 128.0 {
         return (bm.clone(), bm);
     }
-    let stroked = caches.stroke(outline, bord_x.max(0.0), bord_y.max(0.0));
+    let (stroked, stroked_cbox) = caches.stroke(outline, bord_x.max(0.0), bord_y.max(0.0));
     // libass snaps the border outline by its own control box.
-    let bshift = snap(&m2, &stroked, residual, false).unwrap_or(shift);
+    let bshift = snap(&m2, stroked_cbox, residual, false).unwrap_or(shift);
     let bo = raster(caches, outline, Some(&stroked), &m2, bshift);
     (bm, bo)
 }
 
-/// Sum bitmaps into one covering all of them, plus `pad` on each side.
-fn combine(bms: &[Bitmap], pad: i32) -> Option<Bitmap> {
-    let first = bms.first()?;
-    let (mut l, mut t, mut r, mut b) = (first.left, first.top, first.left + first.w, first.top + first.h);
-    for bm in &bms[1..] {
-        l = l.min(bm.left);
-        t = t.min(bm.top);
-        r = r.max(bm.left + bm.w);
-        b = b.max(bm.top + bm.h);
+/// Sum the pieces into one bitmap covering all of them, plus `pad` on
+/// each side.
+fn combine(pieces: &[Piece], pad: i32) -> Option<Bitmap> {
+    let first = pieces.first()?;
+    let (mut l, mut t, mut r, mut b) = (first.left(), first.top(), first.left() + first.bm.w, first.top() + first.bm.h);
+    for p in &pieces[1..] {
+        l = l.min(p.left());
+        t = t.min(p.top());
+        r = r.max(p.left() + p.bm.w);
+        b = b.max(p.top() + p.bm.h);
     }
-    if bms.len() == 1 && pad == 0 {
-        return Some(first.clone());
+    if pieces.len() == 1 && pad == 0 {
+        let mut one = (*first.bm).clone();
+        one.left = first.left();
+        one.top = first.top();
+        return Some(one);
     }
     let mut out = Bitmap::new(l - pad, t - pad, r - l + 2 * pad, b - t + 2 * pad);
-    for bm in bms {
-        bitmap::add_into(&mut out, bm, 0, 0);
+    for p in pieces {
+        bitmap::add_into(&mut out, &p.bm, p.dx, p.dy);
     }
     Some(out)
+}
+
+/// The run's composite cache key and anchor: `None` when a piece has no
+/// bitmap key (perspective, opaque boxes).
+fn composite_key(c: &Combined) -> Option<((i32, i32), CompositeKey)> {
+    let anchor = c.glyphs.first().or(c.borders.first()).map(|p| (p.left(), p.top()))?;
+    let rel = |ps: &[Piece]| -> Option<Vec<(BitmapKey, i32, i32)>> {
+        ps.iter().map(|p| p.key.map(|k| (k, p.left() - anchor.0, p.top() - anchor.1))).collect()
+    };
+    Some((
+        anchor,
+        CompositeKey {
+            glyphs: rel(&c.glyphs)?,
+            borders: rel(&c.borders)?,
+            be: c.be,
+            blur: (c.blur_x, c.blur_y),
+            shadow: c.shadow,
+            flags: c.flags,
+        },
+    ))
 }
 
 /// libass `ass_composite_construct`.
@@ -425,9 +501,10 @@ fn composite(c: &mut Combined) {
             bitmap::fix_outline(g, o);
         }
     }
-    c.bm = bm.filter(|b| !b.is_empty()).map(Arc::new);
-    c.bm_o = bm_o.filter(|b| !b.is_empty()).map(Arc::new);
-    c.bm_s = bm_s.filter(|b| !b.is_empty()).map(Arc::new);
+    let place = |b: Option<Bitmap>| b.filter(|b| !b.is_empty()).map(|b| (Arc::new(b), (0, 0)));
+    c.bm = place(bm);
+    c.bm_o = place(bm_o);
+    c.bm_s = place(bm_s);
 }
 
 /// libass `render_and_combine_glyphs` + composite + `render_text`: the
@@ -540,7 +617,25 @@ pub fn render(text: &mut Text, st: &State<'_>, caches: &mut Caches) -> Vec<Image
             let lm = if run.leftmost_x == f64::MAX { 0.0 } else { lrint(run.leftmost_x) as f64 };
             run.effect_timing = (from_d6(lm as i32) + from_d6(run.effect_timing) * st.frame.par).round() as i32;
         }
+        // libass composite cache: the same pieces at the same relative
+        // places with the same blur / border / shadow give the same
+        // bitmaps, only moved. Animation of colour, alpha, karaoke
+        // progress or position reuses them.
+        let key = composite_key(run);
+        if let Some((anchor, k)) = &key {
+            if let Some((at, [g, o, s])) = caches.composite(k) {
+                let d = (anchor.0 - at.0, anchor.1 - at.1);
+                run.bm = g.map(|b| (b, d));
+                run.bm_o = o.map(|b| (b, d));
+                run.bm_s = s.map(|b| (b, d));
+                continue;
+            }
+        }
         composite(run);
+        if let Some((anchor, k)) = key {
+            let arc = |b: &Option<Placed>| b.as_ref().map(|(b, _)| Arc::clone(b));
+            caches.put_composite(k, (anchor, [arc(&run.bm), arc(&run.bm_o), arc(&run.bm_s)]));
+        }
     }
 
     // render_text: shadows, then borders, then fills.
@@ -578,9 +673,10 @@ pub fn render(text: &mut Text, st: &State<'_>, caches: &mut Caches) -> Vec<Image
 /// libass `render_glyph` / `render_glyph_i`: images for a bitmap inside
 /// (or, `\iclip`, outside) the clip rectangle, split at `brk` (absolute x)
 /// into `color` left of it and `color2` right of it.
-fn clip_image(st: &State<'_>, bm: &Arc<Bitmap>, color: u32, color2: u32, brk: i32, out: &mut Vec<Image>) {
-    let dst_x = bm.left;
-    let dst_y = bm.top;
+fn clip_image(st: &State<'_>, placed: &Placed, color: u32, color2: u32, brk: i32, out: &mut Vec<Image>) {
+    let (bm, (dx, dy)) = placed;
+    let dst_x = bm.left + dx;
+    let dst_y = bm.top + dy;
     let brk = brk.saturating_sub(dst_x);
     let mut rects: Vec<(i32, i32, i32, i32)> = Vec::with_capacity(4);
     if st.clip_inverse {

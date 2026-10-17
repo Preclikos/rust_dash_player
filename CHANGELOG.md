@@ -3,6 +3,61 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.22
+
+### All platforms
+
+- **ASS frames are blended on the GPU.** The worker no longer flattens a
+  frame into RGBA: it packs every image's 8-bit coverage into one atlas and
+  hands the overlay a triangle list (`ass::Layers`); one premultiplied draw
+  blends them in paint order (wgpu: desktop, web, Apple, Android; the
+  Android GLES present path too). A quarter of the upload, and the per-pixel
+  blend is gone from the CPU: on the Google TV Streamer and the Chromecast
+  with Google TV the frame preparation went from 6–8 ms to 1–2 ms, and in
+  the browser a karaoke OP no longer adds video judder. Frames whose masks
+  don't fit a 2048² atlas are still flattened on the CPU.
+- **Composite cache (libass).** A run of glyphs that comes back with the
+  same bitmaps at the same relative places, blur, border and shadow reuses
+  its blurred / combined bitmaps, only moved: colour, alpha, karaoke and
+  position animation (75 % of runs in a typeset karaoke OP). Glyph bitmaps
+  from the cache are no longer copied into each run.
+- **Faster `\blur`.** Large blurs go libass's way: the bitmap is halved
+  with libass's [1 5 10 10 5 1] filter, blurred small and doubled back, so
+  the cost per pixel no longer grows with the radius (the pyramid's own
+  spread is measured and taken off the small blur — goldens and libass's
+  blur regressions unchanged). The vertical pass gathers one output row at
+  a time instead of scattering into many (memory-bound on 32-bit ARM).
+  Desktop: big blurred drawings 6.0 → 2.4 ms per frame.
+- **Less work per glyph.** Shaping plans are compiled once per face /
+  script / language / features instead of for every run of every frame;
+  the renderer's maps use FxHash (SipHash was slow on 32-bit ARM); a
+  glyph's control box is computed once, a border's once per stroke. A
+  karaoke OP on the Google TV Streamer: 26 → 20 ms per frame.
+- `[subs/ass] perf` also reports the composite cache hit rate.
+
+### Web
+
+- **ASS subtitles render in a Web Worker.** The browser build used to
+  render ASS frames on the page's one thread, in the draw path, next to the
+  video. A dedicated worker now runs the same renderer (a second instance
+  of the module, started from a Blob URL — nothing extra to serve) and
+  hands frames back as GPU masks, transferred. The heaviest stress frame
+  renders at full resolution with no extra video judder over playback
+  without subtitles. `assWorker: false` keeps the old behaviour,
+  `assWorkerModuleUrl` points the worker at `rustplayer.js` when a bundler
+  moved it. Engine side: `Player::set_ass_offload` /
+  `ass_render::AssOffload` (native players keep their render thread).
+
+### Android
+
+- The GLES present path blended subtitle bitmaps as straight alpha although
+  they are premultiplied (semi-transparent edges came out too dark).
+
+### Docs
+
+- `docs/examples/ass-reference.mpd`: a complete reference manifest with
+  two ASS tracks and DVB font descriptors (required and optional).
+
 ## 0.2.21
 
 ### All platforms

@@ -33,6 +33,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+mod ass_worker;
+pub use ass_worker::AssWorker;
+
 // --- module init -------------------------------------------------------------
 
 #[wasm_bindgen(start)]
@@ -325,7 +328,11 @@ impl RustPlayer {
     /// the GPU (same numbers as the native players) when the renderer could
     /// verify the browser's frame conversion, else SDR representations only;
     /// `"sdr"` forces SDR only; `"browser"` shows the HDR rungs as the
-    /// browser converts them (see [`WebHdrPolicy`]).
+    /// browser converts them (see [`WebHdrPolicy`]). ASS subtitles render
+    /// in a Web Worker (a second instance of this module, started from a
+    /// Blob URL, so nothing extra to serve); `assWorker: false` renders them
+    /// on the page's thread instead, `assWorkerModuleUrl` names
+    /// `rustplayer.js` when a bundler moved it away from its snippets.
     ///
     /// Call from a user gesture (a click handler): the browser only lets the
     /// `AudioContext` run after one. The canvas's drawing-buffer size
@@ -363,6 +370,14 @@ impl RustPlayer {
         }
         if let Some(cfg) = buffer {
             player.set_buffer_config(cfg);
+        }
+        // ASS frames render in a Web Worker unless `assWorker: false`
+        // (`assWorkerModuleUrl` when a bundler moved rustplayer.js).
+        if get(&options, "assWorker").and_then(|v| v.as_bool()) != Some(false) {
+            let glue = get(&options, "assWorkerModuleUrl").and_then(|v| v.as_string());
+            if let Some(offload) = ass_worker::WebAssOffload::start(glue) {
+                player.set_ass_offload(Arc::new(offload));
+            }
         }
         let handle = bridge::start(player, manifest_url, host, config);
         Ok(RustPlayer { handle })

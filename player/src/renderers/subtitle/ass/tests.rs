@@ -228,7 +228,13 @@ fn bench_script() {
         let a = std::time::Instant::now();
         let imgs = r.render(&s, &active, ms, frame);
         let b = std::time::Instant::now();
-        let c = composite(&imgs, w, h);
+        // what the overlay does: masks for the GPU (CPU flatten only when
+        // the atlas doesn't fit; ASS_BENCH_CPU=1 forces the flatten)
+        let c = if std::env::var("ASS_BENCH_CPU").is_ok() {
+            composite(&imgs, w, h).map(|c| (c.width, c.height))
+        } else {
+            super::layers(&imgs, w, h).map(|l| (l.width, l.height)).or_else(|| composite(&imgs, w, h).map(|c| (c.width, c.height)))
+        };
         let total = a.elapsed().as_secs_f64() * 1000.0;
         comp_total += b.elapsed().as_secs_f64() * 1000.0;
         if total > worst {
@@ -238,7 +244,7 @@ fn bench_script() {
         times.push(total);
         max_events = max_events.max(active.len());
         max_imgs = max_imgs.max(imgs.len());
-        max_px = max_px.max(c.map_or(0, |c| c.width as u64 * c.height as u64));
+        max_px = max_px.max(c.map_or(0, |(cw, ch)| cw as u64 * ch as u64));
         t += 1000.0 / fps;
     }
     let mut sorted = times.clone();
@@ -258,6 +264,8 @@ fn bench_script() {
         over as f64 / n as f64 * 100.0,
         max_px as f64 / 1e6
     );
+    let (lookups, hits) = r.composite_lookups();
+    println!("  composite cache: {hits} hits of {lookups} runs ({:.0}%)", hits as f64 / lookups.max(1) as f64 * 100.0);
 }
 
 /// libass's own regression suite (github.com/libass/libass-tests):

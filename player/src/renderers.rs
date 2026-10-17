@@ -46,6 +46,11 @@ pub trait VideoSink: Send + Sync + 'static {
         0
     }
 
+    /// Render ASS frames through `offload` (see
+    /// [`subtitle::AssOffload`]); the browser shell's Web Worker. Default:
+    /// ignored.
+    fn set_ass_offload(&self, _offload: std::sync::Arc<dyn subtitle::AssOffload>) {}
+
     /// Apply subtitle styling (text/outline colour, size multiplier).
     /// Default no-op so sinks that don't render subtitles keep compiling.
     /// Sinks that own the overlay store it and invalidate any cached

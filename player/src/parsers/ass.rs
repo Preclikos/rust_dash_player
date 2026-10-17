@@ -266,9 +266,34 @@ pub struct AssScript {
     /// In file order.
     pub events: Vec<AssEvent>,
     pub fonts: Vec<EmbeddedFont>,
+    /// What the script was parsed from, for a renderer that rebuilds it
+    /// elsewhere (the browser's render worker); `None` when built by hand.
+    pub source: Option<AssSource>,
+}
+
+/// An [`AssScript`]'s text (decoded) and the time shift applied to its
+/// events: [`parse`] + [`AssScript::shift_events`] give the same script.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AssSource {
+    pub text: std::sync::Arc<str>,
+    pub time_offset_ms: i64,
 }
 
 impl AssScript {
+    /// Move every event by `offset_ms` (a sidecar's sync offset). The
+    /// events themselves move, not just their cues: `\t`, `\fad` and
+    /// `\move` are timed from the event's own start.
+    pub fn shift_events(&mut self, offset_ms: i64) {
+        if offset_ms == 0 {
+            return;
+        }
+        for e in &mut self.events {
+            let end = (e.end_ms() + offset_ms).max(0);
+            e.start_ms = (e.start_ms + offset_ms).max(0);
+            e.duration_ms = end - e.start_ms;
+        }
+    }
+
     /// libass `ass_lookup_style`: leading `*` ignored, `Default` matched
     /// case-insensitively, otherwise an exact match, the last definition
     /// winning; the default style when nothing matches.
@@ -383,6 +408,7 @@ pub fn parse(body: &str) -> Option<AssScript> {
             default_style: 0,
             events: Vec::new(),
             fonts: Vec::new(),
+            source: None,
         },
         font_name: None,
         font_data: Vec::new(),

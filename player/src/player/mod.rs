@@ -1798,6 +1798,13 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.add_subtitle_font(bytes)
     }
 
+    /// Render ASS frames away from the thread that draws: the browser shell
+    /// passes its render Web Worker here (see [`crate::ass_render`]). Native
+    /// players render on their own worker thread and need nothing.
+    pub fn set_ass_offload(&self, offload: std::sync::Arc<dyn crate::ass_render::AssOffload>) {
+        self.video_renderer.set_ass_offload(offload);
+    }
+
     /// Set the subtitle overlay's visual style — text/outline colour and a
     /// size multiplier (see [`SubtitleStyle`]). Values are sanitised into
     /// the safe rendering range before being applied, and the change takes
