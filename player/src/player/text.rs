@@ -7,6 +7,49 @@ use super::*;
 // Subtitle (WebVTT) pipeline
 // ---------------------------------------------------------------------------
 
+/// Why a subtitle track did not load; `text_play` returns it and the player
+/// reports it as [`PlayerEvent::SubtitleTrackFailed`].
+#[derive(Debug)]
+pub(super) struct SubtitleLoadError {
+    pub kind: PlayerErrorKind,
+    pub detail: String,
+}
+
+impl std::fmt::Display for SubtitleLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl Error for SubtitleLoadError {}
+
+impl SubtitleLoadError {
+    /// A download of `what` that failed with the HTTP client's error `e`.
+    fn fetch(what: &str, e: impl std::fmt::Display) -> Box<Self> {
+        let detail = format!("{what}: {e}");
+        Box::new(Self { kind: request_error_kind(&detail), detail })
+    }
+
+    fn other(detail: String) -> Box<Self> {
+        Box::new(Self { kind: PlayerErrorKind::Other, detail })
+    }
+}
+
+/// The error kind of a failed request, from the HTTP client's error text
+/// (`http <status>` for a refused request, `interceptor…` for the host's
+/// interceptor, anything else is the network).
+pub(super) fn request_error_kind(detail: &str) -> PlayerErrorKind {
+    let status = detail.match_indices("http ").find_map(|(i, _)| {
+        let digits = detail[i + 5..].get(..3)?;
+        digits.bytes().all(|b| b.is_ascii_digit()).then(|| digits.parse().ok()).flatten()
+    });
+    match status {
+        Some(status) => PlayerErrorKind::Http { status },
+        None if detail.contains("interceptor") => PlayerErrorKind::Interceptor,
+        None => PlayerErrorKind::Network,
+    }
+}
+
 /// Turn a parsed sidecar file into the track pair the rest of the player
 /// speaks: one representation carrying the cues, wrapped in its own
 /// adaptation set (a sidecar file has its own language and role, which is
@@ -114,35 +157,32 @@ pub(super) async fn text_play<V: VideoSink>(
     // ---- ASS/SSA: one script file per track ----
     if text_representation.is_ass() {
         let Some(url) = &text_representation.single_file_url else {
-            log::info!(
-                "[subs] ASS representation {} is not a single file — only BaseURL delivery is supported",
-                text_representation.id
-            );
-            return Ok(());
+            return Err(SubtitleLoadError::other(
+                "ASS track is not a single file (only BaseURL delivery is supported)".into(),
+            ));
         };
         log::info!("[subs] downloading ASS script: {}", url);
         let bytes = match http.get(url.clone(), RequestKind::InitSegment).await {
             Ok(b) => b,
-            Err(e) => {
-                log::warn!("[subs] ASS download failed: {}", e);
-                return Ok(());
-            }
+            Err(e) => return Err(SubtitleLoadError::fetch(&format!("script {url}"), e)),
         };
         if stopped() || !still_selected(&active) {
             return Ok(());
         }
         // Fonts the manifest lists for the track, before the first frame so
-        // it doesn't flash up in the fallback face.
+        // it doesn't flash up in the fallback face. Without an essential one
+        // (DVB EssentialProperty) the track is not shown at all; a
+        // supplemental one falls back to another face.
         for font in &text_representation.fonts {
             match http.get(font.url.clone(), RequestKind::InitSegment).await {
                 Ok(bytes) => {
                     let faces = video_sink.add_subtitle_font(bytes.to_vec());
                     log::info!("[subs] font {} ({:?}): {} faces", font.url, font.family, faces);
                 }
-                Err(e) => {
-                    let level = if font.essential { log::Level::Warn } else { log::Level::Info };
-                    log::log!(level, "[subs] font {} not loaded: {}", font.url, e);
+                Err(e) if font.essential => {
+                    return Err(SubtitleLoadError::fetch(&format!("essential font {}", font.url), e));
                 }
+                Err(e) => log::info!("[subs] font {} not loaded: {}", font.url, e),
             }
             if stopped() || !still_selected(&active) {
                 return Ok(());
@@ -165,7 +205,7 @@ pub(super) async fn text_play<V: VideoSink>(
                 }
                 video_sink.queue_subtitle_cues(parsed.cues);
             }
-            Err(e) => log::warn!("[subs] ASS script from {} not usable: {}", url, e),
+            Err(e) => return Err(SubtitleLoadError::other(format!("script {url} not usable: {e}"))),
         }
         return Ok(());
     }
@@ -185,10 +225,7 @@ pub(super) async fn text_play<V: VideoSink>(
         log::info!("[subs] downloading single-file VTT: {}", url);
         let bytes = match http.get(url.clone(), RequestKind::InitSegment).await {
             Ok(b) => b,
-            Err(e) => {
-                log::warn!("[subs] single-file download failed: {}", e);
-                return Ok(());
-            }
+            Err(e) => return Err(SubtitleLoadError::fetch(&format!("subtitle file {url}"), e)),
         };
         if stopped() || !still_selected(&active) {
             return Ok(());

@@ -52,6 +52,13 @@ class RustPlayer(private val context: Context) {
         fun onError(kind: String, detail: String) {}
 
         /**
+         * The selected subtitle track did not load (its file, or a font the
+         * manifest marks essential); not fatal, playback goes on without it.
+         * [kind] is spelled like [onError]'s (`http_404`, `network`, ...).
+         */
+        fun onSubtitleTrackFailed(representationId: Int, kind: String, detail: String) {}
+
+        /**
          * Raw 1 Hz stats JSON (debug-HUD food): decoder, frames
          * decoded/dropped, av_drift_ms, video/audio_buffer_ahead_ms,
          * video_segment, stall_events, pipeline_retries, render_gap_max_ms,
@@ -444,6 +451,9 @@ class RustPlayer(private val context: Context) {
             }
             "end_of_stream" -> l.onEnded()
             "error" -> l.onError(o.optString("kind"), o.optString("detail"))
+            "subtitle_track_failed" -> l.onSubtitleTrackFailed(
+                o.optInt("representation_id"), o.optString("kind"), o.optString("detail")
+            )
         }
     }
 }

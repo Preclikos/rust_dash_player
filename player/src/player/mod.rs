@@ -459,8 +459,11 @@ struct SurfaceHold {
 /// download: without them the frames would play with no subtitles, or with
 /// fallback faces that then jump to the real ones. The host sees
 /// `Buffering { TrackSwitch }`; `Playing` follows with the first frame
-/// after the release. A host `pause()` while held cancels the hold (the
-/// release then leaves playback paused).
+/// after the release. The hold lasts until the downloads are over (the HTTP
+/// client's timeouts and retry policy bound them); when they fail, playback
+/// goes on without the track and the host gets `SubtitleTrackFailed`. A
+/// host `pause()` while held cancels the hold (the release then leaves
+/// playback paused).
 #[derive(Default)]
 struct SubtitleHold {
     /// The hold paused playback (so it may resume it).
@@ -468,10 +471,6 @@ struct SubtitleHold {
     /// The subtitle selection it is for (see `Player::subtitle_selection`).
     selection: AtomicU64,
 }
-
-/// Longest a subtitle download holds playback; then it plays on and the
-/// subtitles appear when they are in.
-const SUBTITLE_HOLD_MAX: Duration = Duration::from_secs(10);
 
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
@@ -1993,22 +1992,30 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             self.subtitle_hold_begin(selection);
         }
         let release = self.clone();
+        let representation_id = representation.id;
         self.rt.spawn(async move {
             let res = text_play(repr, stop_epoch, http, sink, active, target, position_ms).await;
+            let mut why = "subtitles in";
             if let Err(e) = res {
-                log::warn!("[subs] text_play exited: {}", e);
+                match e.downcast_ref::<SubtitleLoadError>() {
+                    // reported only while it is still the host's selection
+                    Some(f) if release.subtitle_selection.load(Ordering::SeqCst) == selection => {
+                        log::warn!("[subs] track {} failed ({:?}): {}", representation_id, f.kind, f.detail);
+                        why = "subtitles failed, playing on without them";
+                        let _ = release.events.send(PlayerEvent::SubtitleTrackFailed {
+                            representation_id,
+                            kind: f.kind,
+                            detail: f.detail.clone(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => log::warn!("[subs] text_play exited: {}", e),
+                }
             }
             if hold {
-                release.subtitle_hold_end(selection, "subtitles in");
+                release.subtitle_hold_end(selection, why);
             }
         });
-        if hold {
-            let release = self.clone();
-            self.rt.spawn(async move {
-                crate::rt::sleep(SUBTITLE_HOLD_MAX).await;
-                release.subtitle_hold_end(selection, "still downloading after 10 s, playing on");
-            });
-        }
     }
 
     /// Hold playback for subtitle selection `selection` (see [`SubtitleHold`]).
@@ -3848,6 +3855,13 @@ hi
         }
         assert!(buffering, "the host is told it is buffering");
         assert!(wait_unpaused(&player).await, "released once the download is over");
+        let mut failed = None;
+        while let Ok(e) = events.try_recv() {
+            if let PlayerEvent::SubtitleTrackFailed { kind, .. } = e {
+                failed = Some(kind);
+            }
+        }
+        assert_eq!(failed, Some(PlayerErrorKind::Http { status: 404 }), "the host is told the track failed");
 
         // A host pause during the hold stays.
         player.set_subtitle_track(&ass_track(&url));
@@ -3859,6 +3873,14 @@ hi
         player.set_subtitle_track(&ass_track(&url));
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(player.is_paused());
+    }
+
+    #[test]
+    fn subtitle_request_errors_are_classified() {
+        assert_eq!(request_error_kind("script http://x/a.ass: http 404"), PlayerErrorKind::Http { status: 404 });
+        assert_eq!(request_error_kind("essential font http://x/f.ttf: http 503"), PlayerErrorKind::Http { status: 503 });
+        assert_eq!(request_error_kind("script http://x/a.ass: interceptor timeout (10000ms)"), PlayerErrorKind::Interceptor);
+        assert_eq!(request_error_kind("script http://x/a.ass: error sending request"), PlayerErrorKind::Network);
     }
 
     #[tokio::test]

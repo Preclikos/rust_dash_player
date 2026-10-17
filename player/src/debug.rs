@@ -172,6 +172,9 @@ fn describe_event(ev: &crate::PlayerEvent) -> Option<String> {
             )
         }
         E::GlitchRecovered { detail } => format!("recovered: {detail}"),
+        E::SubtitleTrackFailed { representation_id, kind, detail } => {
+            format!("subtitle track {representation_id} failed ({kind:?}): {detail}")
+        }
         E::EndOfStream => "end of stream".into(),
         E::Error { kind, detail } => format!("ERROR {kind:?}: {detail}"),
     })

@@ -60,6 +60,9 @@ public protocol RustPlayerDelegate: AnyObject {
     func rustPlayer(_ player: RustPlayer, videoSize size: CGSize)
     func rustPlayerDidEnd(_ player: RustPlayer)
     func rustPlayer(_ player: RustPlayer, didError kind: String, detail: String)
+    /// The selected subtitle track did not load (its file, or a font the
+    /// manifest marks essential); not fatal, playback goes on without it.
+    func rustPlayer(_ player: RustPlayer, subtitleTrackFailed representationId: Int, kind: String, detail: String)
 }
 
 public extension RustPlayerDelegate {
@@ -72,6 +75,7 @@ public extension RustPlayerDelegate {
     func rustPlayer(_ player: RustPlayer, videoSize size: CGSize) {}
     func rustPlayerDidEnd(_ player: RustPlayer) {}
     func rustPlayer(_ player: RustPlayer, didError kind: String, detail: String) {}
+    func rustPlayer(_ player: RustPlayer, subtitleTrackFailed representationId: Int, kind: String, detail: String) {}
 }
 
 /// Idiomatic Swift wrapper over the Rust player FFI. Create one per
@@ -392,6 +396,11 @@ public final class RustPlayer {
         case "error":
             d?.rustPlayer(self,
                           didError: obj["kind"] as? String ?? "",
+                          detail: obj["detail"] as? String ?? "")
+        case "subtitle_track_failed":
+            d?.rustPlayer(self,
+                          subtitleTrackFailed: (obj["representation_id"] as? NSNumber)?.intValue ?? 0,
+                          kind: obj["kind"] as? String ?? "",
                           detail: obj["detail"] as? String ?? "")
         default: break
         }

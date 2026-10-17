@@ -46,6 +46,16 @@ pub enum PlayerEvent {
     TrackChanged { kind: TrackKind, info: TrackInfo },
     /// Decoder hiccup the player recovered from. UI hint, not fatal.
     GlitchRecovered { detail: String },
+    /// The selected subtitle track could not be loaded: its file did not
+    /// download or parse, or a font the manifest marks essential did not
+    /// download. Not fatal — playback goes on without the track (a font
+    /// listed as supplemental only falls back to another face and is not
+    /// reported). Selecting the track again retries.
+    SubtitleTrackFailed {
+        representation_id: u32,
+        kind: PlayerErrorKind,
+        detail: String,
+    },
     /// Cumulative stats — emitted at ≤ 1 Hz.
     Stats {
         /// Absolute stream position of the rendered frame, ms (same axis as

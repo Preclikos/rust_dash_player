@@ -353,6 +353,7 @@ Implemented exactly as originally specced — summary:
 | `Position` | ≤ 4 Hz | `position`, `duration`, `buffered_ahead_secs`, `bandwidth_bps` |
 | `TrackChanged` | selection or ABR switch | `TrackKind`, `TrackInfo` |
 | `GlitchRecovered` | recovered hiccup | detail |
+| `SubtitleTrackFailed` | the selected subtitle track's file (or an essential font) did not load; not fatal, playback goes on without it | `representation_id`, `PlayerErrorKind`, detail |
 | `Stats` | ≤ 1 Hz | see below |
 | `EndOfStream` | natural end only (never on errors) | |
 | `Error { kind, detail }` | fatal after internal retries | `PlayerErrorKind` |
@@ -605,11 +606,16 @@ A complete, commented manifest: `docs/examples/ass-reference.mpd`.
 
 The fonts (DVB-DASH font download, ETSI TS 103 285 §7.2 — any number per
 track, URLs relative to the MPD's base) are fetched when the track is
-selected, before its first frame. `EssentialProperty` instead of
-`SupplementalProperty` marks a font as required; a missing one is only
-logged louder — the text then falls back like any unknown font. The
-script's charset is detected like a sidecar's. ASS inside ISO BMFF
-segments has no standard carriage and is not read.
+selected, before its first frame. Selecting the track holds playback
+(`Buffering { TrackSwitch }`) until the script and its fonts are in; the
+HTTP client's timeouts and `RetryPolicy` bound the wait. `EssentialProperty`
+instead of `SupplementalProperty` marks a font as required: when it, or the
+script, does not download (or the script does not parse), playback goes on
+without the track and the host gets `SubtitleTrackFailed { representation_id,
+kind, detail }` (`subtitle_track_failed` in the bridge JSON; selecting the
+track again retries). A supplemental font that fails only falls back like
+any unknown font. The script's charset is detected like a sidecar's. ASS
+inside ISO BMFF segments has no standard carriage and is not read.
 
 **Fonts.** Scripts name fonts by family; a face matches the libass way
 (family name, then the closest weight/slant, or full / PostScript name).

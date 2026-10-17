@@ -16,6 +16,18 @@ pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 - Subtitle textures upload with their own pixel-unpack state instead of
   whatever the renderer's last texture upload left set.
 
+### All platforms
+
+- **A styled subtitle track loads completely or reports why not.**
+  Selecting an ASS track holds playback until its script and fonts are in,
+  with no 10 s cut-off any more (the HTTP client's timeouts and retry policy
+  bound the wait). When the script or a font the manifest marks essential
+  does not download, or the script does not parse, playback goes on
+  without the track and the host gets the new, non-fatal
+  `PlayerEvent::SubtitleTrackFailed { representation_id, kind, detail }`
+  (bridge JSON `subtitle_track_failed`, with `kind` like `error`'s). A
+  single-file WebVTT track that does not download reports the same way.
+
 ## 0.2.24
 
 ### All platforms

@@ -653,8 +653,8 @@ fn spawn_event_pump(
 /// Serialize one [`PlayerEvent`] to the unified event JSON. Schema:
 /// `{"type": "...", <fields>}` where `type` is one of `idle`,
 /// `manifest_loaded`, `prepared`, `buffering`, `playing`, `paused`,
-/// `position`, `track_changed`, `glitch_recovered`, `stats`, `end_of_stream`,
-/// `error`. (The pump additionally synthesizes a `video_size` event —
+/// `position`, `track_changed`, `glitch_recovered`, `subtitle_track_failed`,
+/// `stats`, `end_of_stream`, `error`. (The pump additionally synthesizes a `video_size` event —
 /// `{"type":"video_size","width","height"}` — when the rendered resolution
 /// first appears / changes; it is not produced here.)
 pub fn event_to_json(ev: &PlayerEvent) -> String {
@@ -700,6 +700,12 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
         PlayerEvent::GlitchRecovered { detail } => {
             format!(r#"{{"type":"glitch_recovered","detail":{}}}"#, jstr(detail))
         }
+        PlayerEvent::SubtitleTrackFailed { representation_id, kind, detail } => format!(
+            r#"{{"type":"subtitle_track_failed","representation_id":{},"kind":{},"detail":{}}}"#,
+            representation_id,
+            jstr(&error_kind(kind)),
+            jstr(detail)
+        ),
         PlayerEvent::Stats {
             position_ms,
             video_frames_decoded,
