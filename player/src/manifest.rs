@@ -30,10 +30,12 @@ impl Manifest {
     }
 
     fn parse(content: &str) -> Result<MPD, Box<dyn std::error::Error>> {
-        from_str::<MPD>(content).map_err(|e| -> Box<dyn std::error::Error> {
+        let mut mpd = from_str::<MPD>(content).map_err(|e| -> Box<dyn std::error::Error> {
             log::error!("Failed to parse MPD: {}", e);
             "Failed to parse MPD".into()
-        })
+        })?;
+        mpd.normalize();
+        Ok(mpd)
     }
 }
 
@@ -89,6 +91,49 @@ pub struct MPD {
     pub periods: Vec<Period>,
 }
 
+impl MPD {
+    /// After parsing: Representations take `mimeType` / `codecs` from their
+    /// AdaptationSet when they don't set their own (DASH common
+    /// attributes), and get their numeric key: `Representation@id` is a
+    /// string in DASH, the player keys representations by number. A
+    /// numeric id is its own number; any other id gets the next number no
+    /// numeric id in the MPD uses.
+    fn normalize(&mut self) {
+        for a in self.periods.iter_mut().flat_map(|p| &mut p.adaptation_sets) {
+            for r in &mut a.representations {
+                if r.mime_type.is_empty() {
+                    r.mime_type = a.mime_type.clone().unwrap_or_default();
+                }
+                if r.codecs.is_none() {
+                    r.codecs = a.codecs.clone();
+                }
+            }
+            if a.content_type.is_empty() {
+                let mime = a.mime_type.clone().or_else(|| a.representations.first().map(|r| r.mime_type.clone())).unwrap_or_default();
+                a.content_type = match mime.split('/').next().unwrap_or("") {
+                    "video" => "video",
+                    "audio" => "audio",
+                    "text" => "text",
+                    _ if mime.contains("ttml") || mime.contains("vtt") => "text",
+                    _ => "",
+                }
+                .to_string();
+            }
+        }
+        let reps = || self.periods.iter().flat_map(|p| &p.adaptation_sets).flat_map(|a| &a.representations);
+        let mut next = reps().filter_map(|r| r.id_attr.parse::<u32>().ok()).max().map_or(0, |m| m.saturating_add(1));
+        for r in self.periods.iter_mut().flat_map(|p| &mut p.adaptation_sets).flat_map(|a| &mut a.representations) {
+            r.id = match r.id_attr.parse::<u32>() {
+                Ok(n) => n,
+                Err(_) => {
+                    next = next.saturating_add(1);
+                    next - 1
+                }
+            };
+        }
+    }
+}
+
 #[derive(Deserialize, Clone)]
 pub struct Period {
     #[serde(rename = "AdaptationSet")]
@@ -99,7 +144,8 @@ pub struct Period {
 pub struct AdaptationSet {
     #[serde(rename = "@id")]
     pub id: u32,
-    #[serde(rename = "@contentType")]
+    /// From `mimeType` when absent (see `MPD::normalize`).
+    #[serde(rename = "@contentType", default)]
     pub content_type: String,
     #[serde(rename = "@subsegmentAlignment")]
     pub subsegment_alignment: Option<bool>,
@@ -115,6 +161,12 @@ pub struct AdaptationSet {
 
     #[serde(rename = "@lang")]
     pub lang: Option<String>,
+
+    /// Common to the Representations (see `MPD::normalize`).
+    #[serde(rename = "@mimeType")]
+    pub mime_type: Option<String>,
+    #[serde(rename = "@codecs")]
+    pub codecs: Option<String>,
 
     /// DASH `Role` element — `urn:mpeg:dash:role:2011` `value` attribute
     /// (e.g. "main", "dub", "commentary"). Multiple roles per track are
@@ -147,13 +199,19 @@ pub struct Property {
 
 #[derive(Deserialize, Clone)]
 pub struct Representation {
+    /// `@id` as written (any string).
     #[serde(rename = "@id")]
+    pub id_attr: String,
+    /// The player's key for it (see `MPD::number_representations`).
+    #[serde(skip)]
     pub id: u32,
     #[serde(rename = "@bandwidth")]
     pub bandwidth: u64,
-    #[serde(rename = "@mimeType")]
+    /// Inherited from the AdaptationSet when the Representation has none.
+    #[serde(rename = "@mimeType", default)]
     pub mime_type: String,
 
+    /// Inherited from the AdaptationSet when the Representation has none.
     #[serde(rename = "@codecs")]
     pub codecs: Option<String>,
 
@@ -225,7 +283,7 @@ pub fn slice_adaptation_set(content: &str, adaptation_id: u32) -> Option<&str> {
 
 /// Slice the substring `<Representation id="rep_id" ...>...</Representation>`
 /// out of the given block (typically the result of `slice_adaptation_set`).
-pub fn slice_representation(block: &str, rep_id: u32) -> Option<&str> {
+pub fn slice_representation<'a>(block: &'a str, rep_id: &str) -> Option<&'a str> {
     let needle = format!("<Representation id=\"{}\"", rep_id);
     let start = block.find(&needle)?;
     let rest = &block[start..];
@@ -487,7 +545,7 @@ mod tests {
     #[test]
     fn slice_representation_pulls_inner_rep_block() {
         let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
-        let rep = slice_representation(adapt, 315074).expect("rep found");
+        let rep = slice_representation(adapt, "315074").expect("rep found");
         assert!(rep.contains("bandwidth=\"6000000\""));
         assert!(rep.contains("width=\"1920\""));
         assert!(!rep.contains("id=\"315075\""));
@@ -496,7 +554,7 @@ mod tests {
     #[test]
     fn slice_representation_missing_id_returns_none() {
         let adapt = slice_adaptation_set(REAL_MPD, 223705).unwrap();
-        assert!(slice_representation(adapt, 999).is_none());
+        assert!(slice_representation(adapt, "999").is_none());
     }
 
     // -------------------------------------------------------------------
@@ -678,6 +736,30 @@ mod tests {
             .map(|a| a.id)
             .collect();
         assert_eq!(video_ids, vec![223705, 223714]);
+    }
+
+    #[test]
+    fn string_ids_and_adaptation_set_common_attributes() {
+        let mpd = r#"<MPD mediaPresentationDuration="PT10S"><Period>
+  <AdaptationSet id="0" contentType="video">
+    <Representation id="7" bandwidth="1" mimeType="video/mp4"><BaseURL>a.mp4</BaseURL></Representation>
+    <Representation id="video-hd" bandwidth="2" mimeType="video/mp4"><BaseURL>b.mp4</BaseURL></Representation>
+  </AdaptationSet>
+  <AdaptationSet id="1" mimeType="text/x-ssa" codecs="ass">
+    <Representation id="sub-cs" bandwidth="1"><BaseURL>cs.ass</BaseURL></Representation>
+  </AdaptationSet>
+</Period></MPD>"#;
+        let mpd = Manifest::parse(mpd).unwrap();
+        assert_eq!(mpd.periods[0].adaptation_sets[1].content_type, "text");
+        let sub = &mpd.periods[0].adaptation_sets[1].representations[0];
+        assert_eq!((sub.mime_type.as_str(), sub.codecs.as_deref()), ("text/x-ssa", Some("ass")));
+        let ids: Vec<(String, u32)> = mpd.periods[0]
+            .adaptation_sets
+            .iter()
+            .flat_map(|a| &a.representations)
+            .map(|r| (r.id_attr.clone(), r.id))
+            .collect();
+        assert_eq!(ids, vec![("7".into(), 7), ("video-hd".into(), 8), ("sub-cs".into(), 9)]);
     }
 
     #[test]

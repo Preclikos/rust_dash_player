@@ -1006,7 +1006,12 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         url.path_segments_mut()
             .expect("Cannot modify path segments")
             .pop();
-        Ok(url.to_string() + "/")
+        // The manifest's query / fragment are not part of the directory.
+        url.set_query(None);
+        url.set_fragment(None);
+        // A manifest at the root leaves "http://host/" — already a directory.
+        let base = url.to_string();
+        Ok(if base.ends_with('/') { base } else { base + "/" })
     }
 
     /// Take over a [`crate::ManifestPrefetch`] started before this player
@@ -3157,6 +3162,15 @@ use net_io::*;
 #[cfg(test)]
 mod tests {
     use super::{plan_buffer, segments_for_target, typical_segment_secs, BufferConfig};
+
+    #[test]
+    fn base_url_is_the_manifest_directory() {
+        type P = super::Player<crate::test_support::NullVideoSink, crate::test_support::TestSink>;
+        let base = |u: &str| P::parse_base_url(u).unwrap();
+        assert_eq!(base("http://h:8765/a/b/m.mpd"), "http://h:8765/a/b/");
+        assert_eq!(base("http://h:8765/m.mpd"), "http://h:8765/");
+        assert_eq!(base("https://cdn/x/m.mpd?token=1#t"), "https://cdn/x/");
+    }
 
     #[test]
     fn buffer_plan_follows_time_bytes_and_refill() {

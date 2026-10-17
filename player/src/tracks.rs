@@ -234,7 +234,7 @@ impl Tracks {
         let mut dolby_vision = dv_codec_sniff;
         if let Some(block) = adaptation_block {
             let rep_block =
-                slice_representation(block, representation.id).unwrap_or(block);
+                slice_representation(block, &representation.id_attr).unwrap_or(block);
             let combined = format!("{}\n{}", block, rep_block);
             // ColourPrimaries=9 (BT.2020) → HDR10.
             let primaries = find_descriptor_values(&combined, "ColourPrimaries");
@@ -358,7 +358,7 @@ impl Tracks {
         // reason it can't read SupplementalProperty — interleaved with
         // other children.)
         let channels = adaptation_block
-            .and_then(|b| slice_representation(b, representation.id))
+            .and_then(|b| slice_representation(b, &representation.id_attr))
             .and_then(find_audio_channel_count)
             .or_else(|| {
                 // Some manifests put it at AdaptationSet level instead.
@@ -373,7 +373,7 @@ impl Tracks {
         // `ec+3` is folded into `ec-3` here so every decoder, support probe and
         // passthrough check downstream treats it as the E-AC-3 it is; the
         // `atmos` flag keeps what it said — if it is plausible at all.
-        let rep_block = adaptation_block.and_then(|b| slice_representation(b, representation.id));
+        let rep_block = adaptation_block.and_then(|b| slice_representation(b, &representation.id_attr));
         let adaptation_header = adaptation_block
             .map(|b| b.find("<Representation").map_or(b, |i| &b[..i]));
         let signalled = codecs == "ec+3"
