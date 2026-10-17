@@ -3,6 +3,19 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.25
+
+### Android
+
+- **No more diagonal streaks on animated ASS subtitles.** On devices whose
+  GL runs on ANGLE over Vulkan (Galaxy S25 FE), the newest karaoke syllable
+  and rotating text were drawn with diagonal streaks: the driver read the
+  last vertex of the subtitle mask buffer as zeros, folding that image's
+  second triangle to the frame's corner. The buffer now carries a spare
+  vertex past the last one drawn.
+- Subtitle textures upload with their own pixel-unpack state instead of
+  whatever the renderer's last texture upload left set.
+
 ## 0.2.24
 
 ### All platforms

@@ -339,8 +339,9 @@ void main() {
     v_color = a_color;
 }";
 
+// highp: atlas coordinates span up to 2048 texels, more than mediump holds.
 const FS_MASK_SRC: &str = "#version 300 es
-precision mediump float;
+precision highp float;
 uniform sampler2D u_texture;
 in vec2 v_tex;
 in vec4 v_color;
@@ -1463,6 +1464,7 @@ impl GlesOesRenderer {
             .swap(bmp.generation, std::sync::atomic::Ordering::Relaxed)
             != bmp.generation
         {
+            reset_unpack_state(gl, 4);
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -1516,7 +1518,7 @@ impl GlesOesRenderer {
         gl.bind_texture(glow::TEXTURE_2D, Some(m.texture));
         if m.uploaded_generation.swap(generation, std::sync::atomic::Ordering::Relaxed) != generation {
             // atlas rows are 1 byte per texel, any width
-            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            reset_unpack_state(gl, 1);
             gl.tex_image_2d(
                 glow::TEXTURE_2D,
                 0,
@@ -1530,8 +1532,15 @@ impl GlesOesRenderer {
             );
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(m.vbo));
-            let bytes: &[u8] = std::slice::from_raw_parts(layers.vertices.as_ptr() as *const u8, layers.vertices.len() * 4);
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
+            // One unused vertex past the last one drawn: ANGLE on Vulkan
+            // (Galaxy S25 FE, Xclipse) fetched the buffer's final vertex as
+            // zeros, folding the last image's second triangle to the frame
+            // origin (diagonal streaks on the newest karaoke syllable).
+            let mut bytes = Vec::with_capacity((layers.vertices.len() + MASK_VERTEX_PAD) * 4);
+            for f in layers.vertices.iter().chain(std::iter::repeat_n(&0.0f32, MASK_VERTEX_PAD)) {
+                bytes.extend_from_slice(&f.to_ne_bytes());
+            }
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &bytes, glow::STREAM_DRAW);
             gl.bind_buffer(glow::ARRAY_BUFFER, None);
             let count = (layers.vertices.len() / crate::renderers::subtitle::ass::LAYER_VERTEX_FLOATS) as i32;
             m.vertex_count.store(count, std::sync::atomic::Ordering::Relaxed);
@@ -1550,6 +1559,23 @@ impl GlesOesRenderer {
         gl.bind_texture(glow::TEXTURE_2D, None);
         gl.active_texture(glow::TEXTURE0);
     }
+}
+
+/// Floats appended after the mask vertices (one vertex), see
+/// `draw_subtitle_masks`.
+const MASK_VERTEX_PAD: usize = crate::renderers::subtitle::ass::LAYER_VERTEX_FLOATS;
+
+/// Tightly packed client-memory uploads. The hook runs inside wgpu's GL
+/// context, and wgpu-hal leaves its own unpack state behind (row length
+/// and image height of its last `write_texture`, an unpack buffer): an
+/// upload with that state reads the rows at the wrong stride.
+unsafe fn reset_unpack_state(gl: &glow::Context, alignment: i32) {
+    gl.bind_buffer(glow::PIXEL_UNPACK_BUFFER, None);
+    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+    gl.pixel_store_i32(glow::UNPACK_IMAGE_HEIGHT, 0);
+    gl.pixel_store_i32(glow::UNPACK_SKIP_PIXELS, 0);
+    gl.pixel_store_i32(glow::UNPACK_SKIP_ROWS, 0);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, alignment);
 }
 
 unsafe fn compile_shader(

@@ -1617,13 +1617,15 @@ impl SubtitleOverlay {
         let vbytes = (masks.vertices.len() * 4) as u64;
         let stale = gpu.as_ref().is_none_or(|g| g.generation != generation);
         if stale {
-            let fits = gpu.as_ref().is_some_and(|g| g.cap_w >= masks.atlas_w && g.cap_h >= masks.atlas_h && g.vcap >= vbytes);
+            let fits = gpu.as_ref().is_some_and(|g| g.cap_w >= masks.atlas_w && g.cap_h >= masks.atlas_h && g.vcap >= vbytes + 64);
             if !fits {
                 let (ow, oh, ov) = gpu.as_ref().map_or((0, 0, 0), |g| (g.cap_w, g.cap_h, g.vcap));
                 let max = self.device.limits().max_texture_dimension_2d;
                 let cap_w = masks.atlas_w.max(ow).next_multiple_of(256).min(max);
                 let cap_h = masks.atlas_h.max(oh).next_multiple_of(64).min(max);
-                let vcap = vbytes.max(ov).next_power_of_two().max(4096);
+                // room past the last vertex (see MASK_VERTEX_PAD in the
+                // GLES hook: ANGLE read a buffer's final vertex as zeros)
+                let vcap = (vbytes + 64).max(ov).next_power_of_two().max(4096);
                 *gpu = Some(self.create_gpu_masks(cap_w, cap_h, vcap));
             }
             let g = gpu.as_mut().expect("just created");
