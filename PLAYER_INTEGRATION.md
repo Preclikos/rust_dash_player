@@ -568,8 +568,20 @@ ASS events are laid out on the **aspect-fitted picture** (the script's
 PlayRes mapped onto the video), not on the cue layout box: the anchor and
 the bottom inset don't move them, `SubtitleStyle::size_scale` scales
 dialogue but not explicitly positioned typesetting (libass font scale), the
-colours come from the script. Animated events re-render at ~30 Hz on the
-overlay's worker; static frames are rendered once per change, like cues.
+colours come from the script. Animated events re-render for every video
+frame on the overlay's worker, which prefetches the frame its render time
+says it can still make; static frames are rendered once per change, like
+cues. Until a frame is ready the previous one stays up. Busy frames (a
+typeset sign is often hundreds of one-glyph events) render on up to three
+more threads; all ASS threads run at low priority (Android), so playback
+keeps its cores. Frames render at most 1920×1080 (a 4K picture gets a
+1080p frame drawn larger), and while animation frames take more than two
+video frames to render, their resolution drops step by step to half and
+climbs back when there is time — on a weak TV stick signs get softer, not
+slower. Lines that stay up are always rendered at full resolution.
+`[subs/ass] perf` (info, every 5 s while ASS is on screen) reports render
+times, frame size, the render scale, and how many draws had their own
+frame (`exact`), a held one or none.
 
 **From a manifest.** A text AdaptationSet with `codecs="ass"` (or
 `mimeType="text/x-ssa"`) and one file in `BaseURL`:

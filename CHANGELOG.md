@@ -3,6 +3,53 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.21
+
+### All platforms
+
+- **ASS: every event shows.** The overlay kept only the last 5000 cues, so
+  in a typeset script (10–20k events: one per sign per frame) everything
+  before them never appeared. ASS tracks are no longer capped; other
+  tracks only past 100 000 cues (endless live text).
+- **ASS animation per video frame.** Animated frames are rendered for each
+  video frame instead of a fixed 30 Hz tick, and the worker prefetches the
+  frame its measured render time can still make — also for frame-by-frame
+  signs (a new event every frame) — instead of finishing frames just after
+  their draw. On the Galaxy S21 nearly every draw now has its own frame.
+- **ASS render cost.** A busy frame renders on up to three more threads;
+  glyph bitmaps are cached across frames (libass's bitmap cache); glyphs
+  that cannot reach the frame are not rasterized (a page of text, a long
+  `\move` from off screen: 6.4 s → 0.17 s per frame); the gaussian `\blur`
+  is fixed point; the final flatten runs in bands. Frames render at most
+  1920×1080, and at down to half resolution while animation frames take
+  longer than two video frames (weak TV sticks: softer, not slower signs).
+  The ASS threads run at low priority on Android. Desktop: a karaoke OP
+  with 580 events per frame went from 7.8 to 2.3 ms per frame.
+- **Web:** the browser renders ASS frames in the draw path (no threads);
+  that path now feeds the same render-time average, so the prefetch and the
+  render scale work there too, and the scale steps down already at half a
+  video frame (the frame also delays the video on the page's only thread).
+- `[subs/ass] perf` log line every 5 s while ASS is on screen.
+- **MPD parsing.** `Representation@id` may be any string (it had to be a
+  number); `mimeType` / `codecs` on the AdaptationSet apply to its
+  Representations; `contentType` is derived from `mimeType` when missing.
+  The documented ASS AdaptationSet example failed on all three.
+- **Base URL of a manifest at the server root** no longer comes out with a
+  double slash (`http://host//seg.mp4`), and the manifest's query string is
+  not part of it.
+
+### Android
+
+- armeabi-v7a builds with NEON (required by the ABI): loops vectorize on
+  32-bit ARM TV boxes.
+
+### Tests and tooling
+
+- `libass_regression`: libass's own regression suite against the renderer
+  (`ASS_REGRESSION=<libass-tests>/regression`); 89 of 103 frames match.
+- `bench_script`: per-frame render benchmark of a script
+  (`ASS_BENCH`, `ASS_PROFILE` phase timings).
+
 ## 0.2.20
 
 ### All platforms

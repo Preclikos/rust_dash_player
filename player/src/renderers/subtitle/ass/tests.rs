@@ -188,3 +188,198 @@ fn dump_frame() {
     ppm.extend(rgb);
     std::fs::write(out, ppm).unwrap();
 }
+
+/// Benchmark: render every frame of a script like the overlay does
+/// (active events per frame, render + composite).
+/// `ASS_BENCH="script.ass;width;height;fps;from_ms;to_ms"`, optional
+/// `ASS_FONTS=<dir>`. Run in release:
+/// `cargo test --release -p player --lib bench_script -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_script() {
+    let Ok(spec) = std::env::var("ASS_BENCH") else { return };
+    let p: Vec<&str> = spec.split(';').collect();
+    let (path, w, h, fps) = (p[0], p[1].parse::<i32>().unwrap(), p[2].parse::<i32>().unwrap(), p[3].parse::<f64>().unwrap());
+    let body = std::fs::read(path).unwrap();
+    let t0 = std::time::Instant::now();
+    let parsed = crate::parsers::sidecar::parse(&body, crate::parsers::sidecar::SubtitleFormat::Ass, None, 0).unwrap();
+    let s = parsed.script.unwrap();
+    let parse_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let from = p.get(4).and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+    let to = p.get(5).and_then(|v| v.parse::<i64>().ok()).unwrap_or_else(|| s.events.iter().map(|e| e.end_ms()).max().unwrap_or(0));
+    let mut r = AssRenderer::new();
+    if let Ok(dir) = std::env::var("ASS_FONTS") {
+        for e in std::fs::read_dir(dir).unwrap().flatten() {
+            let ext = e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ["ttf", "otf", "ttc"].contains(&ext.as_str()) {
+                r.add_font(std::fs::read(e.path()).unwrap());
+            }
+        }
+    }
+    let frame = super::frame_for(&s, w as u32, h as u32, Some((w as u32, h as u32)), 1.0);
+    let mut times = Vec::new();
+    let (mut max_events, mut max_imgs, mut max_px) = (0usize, 0usize, 0u64);
+    let (mut worst_t, mut worst) = (0i64, 0f64);
+    let mut comp_total = 0f64;
+    let mut t = from as f64;
+    while (t as i64) < to {
+        let ms = t as i64;
+        let active: Vec<usize> = s.events.iter().enumerate().filter(|(_, e)| e.start_ms <= ms && ms < e.end_ms()).map(|(i, _)| i).collect();
+        let a = std::time::Instant::now();
+        let imgs = r.render(&s, &active, ms, frame);
+        let b = std::time::Instant::now();
+        let c = composite(&imgs, w, h);
+        let total = a.elapsed().as_secs_f64() * 1000.0;
+        comp_total += b.elapsed().as_secs_f64() * 1000.0;
+        if total > worst {
+            worst = total;
+            worst_t = ms;
+        }
+        times.push(total);
+        max_events = max_events.max(active.len());
+        max_imgs = max_imgs.max(imgs.len());
+        max_px = max_px.max(c.map_or(0, |c| c.width as u64 * c.height as u64));
+        t += 1000.0 / fps;
+    }
+    let mut sorted = times.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = sorted.len().max(1);
+    let avg = times.iter().sum::<f64>() / n as f64;
+    let pct = |q: f64| sorted[((n as f64 - 1.0) * q) as usize];
+    let budget = 1000.0 / fps;
+    let over = times.iter().filter(|&&v| v > budget).count();
+    println!(
+        "{path}: {} events, parse {parse_ms:.0} ms | {n} frames {w}x{h}@{fps} | avg {avg:.2} ms, p50 {:.2}, p95 {:.2}, p99 {:.2}, max {worst:.2} ms @ {worst_t} ms | composite share {:.0}% | over {budget:.1} ms budget: {over} ({:.1}%) | peak {max_events} events, {max_imgs} images, {:.1} Mpx",
+        s.events.len(),
+        pct(0.5),
+        pct(0.95),
+        pct(0.99),
+        comp_total / times.iter().sum::<f64>().max(1e-9) * 100.0,
+        over as f64 / n as f64 * 100.0,
+        max_px as f64 / 1e6
+    );
+}
+
+/// libass's own regression suite (github.com/libass/libass-tests):
+/// every `regression/<case>/<script>-<ms>.png` against our frame, over
+/// grey, box-blurred 3×3 like the golden test. Prints mean |Δ| and the
+/// share of pixels off by more than 64 per case; with `ASS_REGRESSION_OUT`
+/// writes ours | reference side by side (PPM).
+/// `ASS_REGRESSION=<libass-tests>/regression cargo test --release -p player --lib libass_regression -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn libass_regression() {
+    let Ok(root) = std::env::var("ASS_REGRESSION") else { return };
+    let root = std::path::PathBuf::from(root);
+    let out_dir = std::env::var("ASS_REGRESSION_OUT").ok().map(std::path::PathBuf::from);
+    let fonts_in = |dir: &std::path::Path, r: &mut AssRenderer| {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let ext = e.path().extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ["ttf", "otf", "ttc"].contains(&ext.as_str()) {
+                r.add_font(std::fs::read(e.path()).unwrap());
+            }
+        }
+    };
+    const BG: u32 = 0x80;
+    let blur3 = |rgb: &[u8], w: usize, h: usize| -> Vec<u8> {
+        let mut out = vec![0u8; rgb.len()];
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    let mut s = 0u32;
+                    for dy in [-1i32, 0, 1] {
+                        for dx in [-1i32, 0, 1] {
+                            let xx = (x as i32 + dx).clamp(0, w as i32 - 1) as usize;
+                            let yy = (y as i32 + dy).clamp(0, h as i32 - 1) as usize;
+                            s += rgb[(yy * w + xx) * 3 + c] as u32;
+                        }
+                    }
+                    out[(y * w + x) * 3 + c] = (s / 9) as u8;
+                }
+            }
+        }
+        out
+    };
+    let mut cases: Vec<_> = std::fs::read_dir(&root).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir() && !p.ends_with(".fonts")).collect();
+    cases.sort();
+    let mut rows = Vec::new();
+    for case in cases {
+        let mut pngs: Vec<_> = std::fs::read_dir(&case).unwrap().flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|x| x == "png")).collect();
+        pngs.sort();
+        for png_path in pngs {
+            let stem = png_path.file_stem().unwrap().to_string_lossy().to_string();
+            let Some((script_name, ms)) = stem.rsplit_once('-') else { continue };
+            let Ok(ms) = ms.parse::<i64>() else { continue };
+            let Ok(body) = std::fs::read(case.join(format!("{script_name}.ass"))) else { continue };
+            let Ok(parsed) = crate::parsers::sidecar::parse(&body, crate::parsers::sidecar::SubtitleFormat::Ass, None, 0) else {
+                rows.push(format!("{:<40} parse failed", format!("{}/{stem}", case.file_name().unwrap().to_string_lossy())));
+                continue;
+            };
+            let s = parsed.script.unwrap();
+            let mut dec = png::Decoder::new(std::fs::File::open(&png_path).unwrap());
+            dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+            let mut reader = dec.read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size()];
+            let info = reader.next_frame(&mut buf).unwrap();
+            let (w, h, ch) = (info.width as usize, info.height as usize, info.color_type.samples());
+            // reference: straight alpha over grey
+            let mut refc = vec![0u8; w * h * 3];
+            for (i, px) in buf[..info.buffer_size()].chunks(ch).enumerate() {
+                let a = if ch == 4 { px[3] as u32 } else { 255 };
+                for k in 0..3 {
+                    refc[i * 3 + k] = ((px[k] as u32 * a + BG * (255 - a) + 127) / 255) as u8;
+                }
+            }
+            let mut r = AssRenderer::new();
+            fonts_in(&case, &mut r);
+            fonts_in(&root.join(".fonts"), &mut r);
+            let active: Vec<usize> = (0..s.events.len()).collect();
+            let frame = super::frame_for(&s, w as u32, h as u32, Some((w as u32, h as u32)), 1.0);
+            let imgs = r.render(&s, &active, ms, frame);
+            let mut mine = vec![BG as u8; w * h * 3];
+            if let Some(c) = composite(&imgs, w as i32, h as i32) {
+                for y in 0..c.height as usize {
+                    for x in 0..c.width as usize {
+                        let si = (y * c.width as usize + x) * 4;
+                        let di = ((c.top as usize + y) * w + c.left as usize + x) * 3;
+                        let a = c.rgba[si + 3] as u32;
+                        for k in 0..3 {
+                            mine[di + k] = ((c.rgba[si + k] as u32 * 255 + BG * (255 - a) + 127) / 255).min(255) as u8;
+                        }
+                    }
+                }
+            }
+            let (ba, bb) = (blur3(&mine, w, h), blur3(&refc, w, h));
+            let (mut covered, mut sum, mut bad) = (0usize, 0f64, 0usize);
+            for i in 0..w * h {
+                let p = |v: &[u8]| (0..3).any(|k| v[i * 3 + k] as u32 != BG);
+                if !p(&ba) && !p(&bb) {
+                    continue;
+                }
+                covered += 1;
+                let d: Vec<i32> = (0..3).map(|k| (ba[i * 3 + k] as i32 - bb[i * 3 + k] as i32).abs()).collect();
+                sum += d.iter().sum::<i32>() as f64 / 3.0;
+                if d.iter().any(|&v| v > 64) {
+                    bad += 1;
+                }
+            }
+            let mean = sum / covered.max(1) as f64;
+            let bad_pct = bad as f64 / covered.max(1) as f64 * 100.0;
+            let verdict = if mean <= 4.0 && bad_pct <= 0.5 { "ok" } else { "DIFF" };
+            let name = format!("{}/{stem}", case.file_name().unwrap().to_string_lossy());
+            rows.push(format!("{name:<40} {w}x{h} mean {mean:5.2} off {bad_pct:5.2}% {verdict}"));
+            if let Some(dir) = &out_dir {
+                let mut ppm = format!("P6\n{} {h}\n255\n", w * 2).into_bytes();
+                for y in 0..h {
+                    ppm.extend_from_slice(&mine[y * w * 3..(y + 1) * w * 3]);
+                    ppm.extend_from_slice(&refc[y * w * 3..(y + 1) * w * 3]);
+                }
+                std::fs::create_dir_all(dir).unwrap();
+                std::fs::write(dir.join(format!("{}.ppm", name.replace('/', "_"))), ppm).unwrap();
+            }
+        }
+    }
+    for r in &rows {
+        println!("{r}");
+    }
+}

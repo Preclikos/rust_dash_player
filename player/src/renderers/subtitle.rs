@@ -277,8 +277,8 @@ pub fn cue_quad(bitmap: &SubtitleBitmap, parent: &CueParent) -> [f32; 4] {
     };
     let tw = parent.target_w as f32;
     let th = parent.target_h as f32;
-    let bw = bitmap.width as f32;
-    let bh = bitmap.height as f32;
+    let bw = bitmap.width as f32 * bitmap.scale;
+    let bh = bitmap.height as f32 * bitmap.scale;
     // Half-extent in NDC = (px/2) / (target/2) = px / target.
     [
         (x + bw / 2.0) / tw * 2.0 - 1.0,
@@ -425,13 +425,27 @@ struct Shared {
 }
 
 struct Inner {
-    /// Sorted by start_ms ascending. Old cues are pruned when the
-    /// current PTS passes their end. Bounded to a few thousand to
-    /// avoid pathological memory growth on hours-long streams.
+    /// Sorted by start_ms ascending. Bounded only for endless streams
+    /// (see `add_cues`).
     cues: Vec<VttCue>,
     /// Current playback PTS in ms, updated by the render path before
     /// each draw call.
     current_pts_ms: i64,
+    /// Video frame interval (ms), averaged from the PTS steps: animated
+    /// ASS frames are rendered per video frame and the next one is
+    /// prefetched one interval ahead. 0 until measured.
+    frame_ms: f64,
+    /// How long an ASS frame takes the worker (ms, averaged): the
+    /// prefetch aims that far ahead, so a slow device shows every frame it
+    /// bakes instead of finishing each one just after its draw.
+    ass_bake_ms: f64,
+    /// Fraction of the picture size animated ASS frames render at: drops
+    /// (to 1/2) while frames take longer than two video frames to bake —
+    /// a weak TV stick then shows soft but moving signs instead of a few
+    /// frames a second — and climbs back when there is time.
+    ass_scale: f32,
+    /// Bakes since `ass_scale` last changed.
+    ass_scale_age: u32,
     /// fontdue::Font held behind an `Arc` so the render path can take a
     /// reference out of the lock for the price of a refcount bump.
     /// `fontdue::Font` is `Clone`, but that clone deep-copies every
@@ -501,6 +515,45 @@ struct Inner {
 }
 
 impl Inner {
+    /// `SubtitleOverlay::queue_cues`.
+    fn add_cues(&mut self, cues: Vec<VttCue>) {
+        let script = cues.iter().find_map(|c| c.ass.as_ref().map(|a| Arc::clone(&a.script)));
+        if let Some(script) = script {
+            let same = self.ass.as_ref().is_some_and(|t| Arc::ptr_eq(&t.script, &script));
+            if !same {
+                let animated = script.events.iter().map(event_animates).collect();
+                log::info!(
+                    "[subs] ASS track: {} events, {}x{}",
+                    script.events.len(),
+                    script.play_res_x,
+                    script.play_res_y
+                );
+                self.ass = Some(AssTrack { script, animated });
+                self.ass_relayout = true;
+                self.invalidate();
+            }
+        }
+        for c in cues {
+            self.max_cue_span_ms = self.max_cue_span_ms.max(c.end_ms - c.start_ms);
+            self.cues.push(c);
+        }
+        self.cues.sort_by_key(|c| c.start_ms);
+        // Cap memory for an endless (live) text stream: past this many
+        // cues the oldest go. Cues are fetched once and never again, so
+        // the cap must stay far above any finite track — a typeset ASS
+        // script has 10–20k events (one per sign per frame), a 2 h
+        // movie ~2000 dialogue cues. An ASS track is one file whose
+        // events the script holds anyway: never capped.
+        const MAX_CUES: usize = 100_000;
+        if self.ass.is_none() && self.cues.len() > MAX_CUES {
+            let excess = self.cues.len() - MAX_CUES;
+            self.cues.drain(0..excess);
+        }
+        // Indices shifted; force the worker to recompute rather than
+        // trust `wanted`.
+        self.wanted = WantedKey::default();
+    }
+
     /// ASS mode: the events active at `pts_ms`, file indices in cue order.
     fn ass_active(&self, pts_ms: i64) -> Vec<usize> {
         let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
@@ -522,38 +575,96 @@ impl Inner {
             return None;
         }
         let animated = events.iter().any(|&e| track.animated.get(e).copied().unwrap_or(false));
-        let (tick, time_ms) = if animated {
-            let tick = pts_ms.div_euclid(ASS_TICK_MS);
-            (tick, tick * ASS_TICK_MS)
-        } else {
-            (-1, pts_ms)
-        };
-        Some(AssShow { key: AssKey { events, tick }, time_ms })
+        // Animated: rendered for this very frame (libass renders per
+        // video frame).
+        let tick = if animated { pts_ms } else { -1 };
+        Some(AssShow { key: AssKey { events, tick }, time_ms: pts_ms })
     }
 
     /// ASS mode: the frame shown now and the one to prefetch — the next
-    /// tick while something animates, else the frame at the next moment
-    /// an event starts or ends.
+    /// video frame while something animates, else the frame at the next
+    /// moment an event starts or ends.
     fn ass_wanted(&self, pts_ms: i64) -> [Option<AssShow>; 2] {
         let now = self.ass_show(pts_ms);
+        // How far ahead a frame must be asked for to be baked in time.
+        let lead = self.ass_bake_ms * 1.25;
         let next_t = match &now {
-            Some(s) if s.key.tick >= 0 => Some((s.key.tick + 1) * ASS_TICK_MS),
-            _ => {
-                let next_start = self.cues.get(self.cues.partition_point(|c| c.start_ms <= pts_ms)).map(|c| c.start_ms);
-                let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
-                let lo = self.cues.partition_point(|c| c.start_ms <= pts_ms - self.max_cue_span_ms);
-                let next_end = self.cues[lo..hi].iter().filter(|c| c.is_active(pts_ms)).map(|c| c.end_ms).min();
-                match (next_start, next_end) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                }
+            Some(s) if s.key.tick >= 0 => {
+                let step = if self.frame_ms > 0.0 { self.frame_ms } else { ASS_TICK_MS as f64 };
+                // The first frame the bake can still be in time for.
+                let frames = (lead / step).ceil().max(1.0);
+                Some(s.key.tick + (frames * step).round() as i64)
             }
+            // Static: the next event edge — or, when edges come faster
+            // than a bake (frame-by-frame typesetting: a new event every
+            // frame), what is on screen one bake from now.
+            _ => self.ass_next_edge(pts_ms).map(|e| e.max(pts_ms + lead.ceil() as i64)),
         };
         [now, next_t.and_then(|t| self.ass_show(t))]
     }
 
+    /// After a bake of a brief ASS frame: lower the render scale while
+    /// bakes take more than two video frames, raise it back below one
+    /// (a few bakes apart, so the average follows each step). In the
+    /// browser the frame renders on the page's only thread, in the draw
+    /// path, where it delays the video too: there the bounds are half and
+    /// a quarter of a frame.
+    fn adapt_ass_scale(&mut self) {
+        const MIN: f32 = 0.5;
+        const SLOW: f64 = if cfg!(target_arch = "wasm32") { 0.5 } else { 2.0 };
+        const FAST: f64 = if cfg!(target_arch = "wasm32") { 0.25 } else { 0.8 };
+        self.ass_scale_age += 1;
+        if self.ass_scale_age < 6 {
+            return;
+        }
+        let frame = if self.frame_ms > 0.0 { self.frame_ms } else { ASS_TICK_MS as f64 };
+        let old = self.ass_scale;
+        if self.ass_bake_ms > SLOW * frame && self.ass_scale > MIN {
+            self.ass_scale = (self.ass_scale * 0.85).max(MIN);
+        } else if self.ass_bake_ms < FAST * frame && self.ass_scale < 1.0 {
+            self.ass_scale = (self.ass_scale / 0.9).min(1.0);
+        }
+        if self.ass_scale != old {
+            self.ass_scale_age = 0;
+            log::debug!("[subs/ass] render scale {:.2} -> {:.2} (bake {:.1} ms)", old, self.ass_scale, self.ass_bake_ms);
+        }
+    }
+
+    /// ASS mode: the first time after `pts_ms` an event starts or ends.
+    fn ass_next_edge(&self, pts_ms: i64) -> Option<i64> {
+        let hi = self.cues.partition_point(|c| c.start_ms <= pts_ms);
+        let lo = self.cues.partition_point(|c| c.start_ms <= pts_ms - self.max_cue_span_ms);
+        let next_start = self.cues.get(hi).map(|c| c.start_ms);
+        let next_end = self.cues[lo..hi].iter().filter(|c| c.is_active(pts_ms)).map(|c| c.end_ms).min();
+        match (next_start, next_end) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// ASS mode: is the frame due at `pts_ms` replaced before a bake of it
+    /// could finish? Then a held frame covers it and the worker skips it.
+    fn ass_now_superseded(&self, now: &AssShow, pts_ms: i64) -> bool {
+        let lead = (self.ass_bake_ms * 1.25).ceil() as i64;
+        now.key.tick >= 0 || self.ass_next_edge(pts_ms).is_some_and(|e| e - pts_ms < lead)
+    }
+
     fn ready_for_ass(&self, key: &AssKey) -> Option<&std::sync::Arc<SubtitleBitmap>> {
-        self.ready.iter().find(|b| b.ass_key.as_ref() == Some(key))
+        self.ready.iter().find(|b| {
+            b.ass_key.as_ref().is_some_and(|k| {
+                k.events == key.events
+                    && (k.tick == key.tick || (k.tick >= 0 && key.tick >= 0 && (k.tick - key.tick).abs() <= ASS_TICK_SLACK_MS))
+            })
+        })
+    }
+
+    /// ASS mode: the latest finished frame from just before `pts_ms`.
+    fn held_ass(&self, pts_ms: i64) -> Option<&std::sync::Arc<SubtitleBitmap>> {
+        self.ready
+            .iter()
+            .filter(|b| b.ass_key.is_some())
+            .filter(|b| (0..=ASS_HOLD_MS).contains(&(pts_ms - b.ass_time_ms)))
+            .max_by_key(|b| b.ass_time_ms)
     }
 
     /// The finished bitmap for what is on screen at `pts_ms`, either kind.
@@ -561,20 +672,22 @@ impl Inner {
         if self.ass.is_some() {
             let show = self.ass_show(pts_ms)?;
             if let Some(b) = self.ready_for_ass(&show.key) {
+                ass_perf(|p| p.exact += 1);
                 return Some(Arc::clone(b));
             }
-            // Not baked yet: the worker is behind on an animation tick, or
-            // an event started / ended mid-tick (the prefetch only covers
-            // the next tick boundary). Keep the latest frame from just
-            // before instead of drawing nothing — every subtitle on screen,
-            // static dialogue included, used to blink off for that frame.
+            // Not baked yet: the worker is behind on the animation, or an
+            // event started / ended between two prefetches. Keep the
+            // latest frame from just before instead of drawing nothing —
+            // every subtitle on screen, static dialogue included, used to
+            // blink off for that frame.
             return self
-                .ready
-                .iter()
-                .filter(|b| b.ass_key.is_some())
-                .filter(|b| (0..=ASS_HOLD_MS).contains(&(pts_ms - b.ass_time_ms)))
-                .max_by_key(|b| b.ass_time_ms)
-                .cloned();
+                .held_ass(pts_ms)
+                .cloned()
+                .inspect(|_| ass_perf(|p| p.held += 1))
+                .or_else(|| {
+                    ass_perf(|p| p.missing += 1);
+                    None
+                });
         }
         let (text, layout) = self.shown_at(pts_ms)?;
         self.ready_for(&text, &layout, target_w).cloned()
@@ -769,6 +882,9 @@ pub struct SubtitleBitmap {
     /// Set for an ASS frame: the bitmap's top-left corner on the picture
     /// (px), which `cue_quad` uses instead of `layout`.
     pub origin: Option<(f32, f32)>,
+    /// Picture px per bitmap px: an ASS frame rendered at reduced
+    /// resolution (see `Inner::ass_scale`) is drawn this much larger.
+    pub scale: f32,
     /// Identity for cache validation: same text + same settings at about
     /// the same parent width = same bitmap.
     text: String,
@@ -780,7 +896,8 @@ pub struct SubtitleBitmap {
 }
 
 /// What an ASS frame shows: the active events (indices into the script)
-/// and, while any of them animates, the animation tick.
+/// and, while any of them animates, the video frame time it is for
+/// (`tick`, ms; -1 for a static frame).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AssKey {
     events: Vec<usize>,
@@ -794,13 +911,93 @@ struct AssShow {
     time_ms: i64,
 }
 
-/// Animated ASS events are re-rendered at this interval (~30 Hz).
+/// Frame interval assumed for the animation prefetch until the PTS steps
+/// have been measured.
 const ASS_TICK_MS: i64 = 33;
+
+/// A frame baked for a time this close to the wanted one stands for it:
+/// the prefetch predicts the next frame time from the average interval,
+/// and 24 fps PTS in whole ms step by 41 / 42.
+const ASS_TICK_SLACK_MS: i64 = 3;
 
 /// How old a finished ASS frame may be and still stand in for the one the
 /// worker hasn't baked yet (see `Inner::shown_bitmap`). Bounded so a seek
 /// never shows a frame from somewhere else.
 const ASS_HOLD_MS: i64 = 1000;
+
+/// ASS frames render at most this large (picture px); a 4K picture gets
+/// a 1080p frame drawn twice as large — subtitle detail beyond that is
+/// invisible at viewing distance and costs four times the work.
+const ASS_MAX_RENDER: (f32, f32) = (1920.0, 1080.0);
+
+/// The fraction of a `w`×`h` picture an ASS frame renders at, at most 1.
+fn ass_render_cap(w: u32, h: u32) -> f32 {
+    (ASS_MAX_RENDER.0 / w.max(1) as f32).min(ASS_MAX_RENDER.1 / h.max(1) as f32).min(1.0)
+}
+
+/// ASS overlay performance, logged as one `[subs/ass] perf` line every
+/// ~5 s while ASS frames render or show: worker render / composite times,
+/// frame size, and how many draws had their frame baked (`exact`), showed
+/// a held older one (`held`) or nothing for want of one (`missing`).
+#[derive(Clone, Copy)]
+struct AssPerf {
+    since: Option<crate::rt::Instant>,
+    frames: u32,
+    render_ms: f64,
+    render_max_ms: f64,
+    composite_ms: f64,
+    max_events: usize,
+    max_images: usize,
+    max_px: u64,
+    exact: u32,
+    held: u32,
+    missing: u32,
+    min_scale: f32,
+}
+
+const ASS_PERF_ZERO: AssPerf = AssPerf {
+    since: None,
+    frames: 0,
+    render_ms: 0.0,
+    render_max_ms: 0.0,
+    composite_ms: 0.0,
+    max_events: 0,
+    max_images: 0,
+    max_px: 0,
+    exact: 0,
+    held: 0,
+    missing: 0,
+    min_scale: 1.0,
+};
+
+static ASS_PERF: Mutex<AssPerf> = Mutex::new(ASS_PERF_ZERO);
+
+fn ass_perf(f: impl FnOnce(&mut AssPerf)) {
+    let Ok(mut p) = ASS_PERF.lock() else { return };
+    f(&mut p);
+    let now = crate::rt::Instant::now();
+    let since = *p.since.get_or_insert(now);
+    if now.duration_since(since).as_secs_f64() < 5.0 {
+        return;
+    }
+    let n = p.frames.max(1) as f64;
+    log::info!(
+        "[subs/ass] perf {:.1}s: {} frames baked, render avg {:.1} max {:.1} ms, composite avg {:.1} ms, peak {} events / {} images / {:.2} Mpx | draws exact {} held {} missing {} | scale {:.2}",
+        now.duration_since(since).as_secs_f64(),
+        p.frames,
+        p.render_ms / n,
+        p.render_max_ms,
+        p.composite_ms / n,
+        p.max_events,
+        p.max_images,
+        p.max_px as f64 / 1e6,
+        p.exact,
+        p.held,
+        p.missing,
+        p.min_scale
+    );
+    *p = AssPerf { since: Some(now), ..ASS_PERF_ZERO };
+}
 
 /// The ASS track the cues belong to.
 struct AssTrack {
@@ -891,6 +1088,10 @@ impl SubtitleOverlay {
             inner: Mutex::new(Inner {
                 cues: Vec::new(),
                 current_pts_ms: 0,
+                frame_ms: 0.0,
+                ass_bake_ms: 0.0,
+                ass_scale: 1.0,
+                ass_scale_age: 0,
                 font: rasterizer::default_font().map(Arc::new),
                 fallback: rasterizer::fallback_font().map(Arc::new),
                 style: SubtitleStyle::DEFAULT,
@@ -1032,39 +1233,7 @@ impl SubtitleOverlay {
     /// Push new cues into the active list. text_play sends a batch per
     /// segment; raw single-file delivery sends the whole list once.
     pub fn queue_cues(&self, cues: Vec<VttCue>) {
-        self.with_inner_notify(|inner| {
-            let script = cues.iter().find_map(|c| c.ass.as_ref().map(|a| Arc::clone(&a.script)));
-            if let Some(script) = script {
-                let same = inner.ass.as_ref().is_some_and(|t| Arc::ptr_eq(&t.script, &script));
-                if !same {
-                    let animated = script.events.iter().map(event_animates).collect();
-                    log::info!(
-                        "[subs] ASS track: {} events, {}x{}",
-                        script.events.len(),
-                        script.play_res_x,
-                        script.play_res_y
-                    );
-                    inner.ass = Some(AssTrack { script, animated });
-                    inner.ass_relayout = true;
-                    inner.invalidate();
-                }
-            }
-            for c in cues {
-                inner.max_cue_span_ms = inner.max_cue_span_ms.max(c.end_ms - c.start_ms);
-                inner.cues.push(c);
-            }
-            inner.cues.sort_by_key(|c| c.start_ms);
-            // Cap memory: keep at most ~5000 cues. 2h movie at 1 cue/2s =
-            // 3600 cues, so plenty of headroom for normal content.
-            const MAX_CUES: usize = 5000;
-            if inner.cues.len() > MAX_CUES {
-                let excess = inner.cues.len() - MAX_CUES;
-                inner.cues.drain(0..excess);
-            }
-            // Indices shifted; force the worker to recompute rather than
-            // trust `wanted`.
-            inner.wanted = WantedKey::default();
-        });
+        self.with_inner_notify(|inner| inner.add_cues(cues));
     }
 
     /// Drop everything — called when the consumer switches subtitle
@@ -1126,6 +1295,10 @@ impl SubtitleOverlay {
             // A jump back (seek): ASS events collide afresh.
             if inner.ass.is_some() && pts_ms + 1000 < inner.current_pts_ms {
                 inner.ass_relayout = true;
+            }
+            let step = pts_ms - inner.current_pts_ms;
+            if (5..=100).contains(&step) {
+                inner.frame_ms = if inner.frame_ms > 0.0 { inner.frame_ms * 0.9 + step as f64 * 0.1 } else { step as f64 };
             }
             inner.current_pts_ms = pts_ms;
             // Called once per frame, so this must stay cheap: two binary
@@ -1376,22 +1549,11 @@ impl SubtitleOverlay {
             job
         };
         let Some(job) = job else { return };
+        let started = crate::rt::Instant::now();
         let rasterized = bake(&job);
+        let bake_ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut inner = self.shared.inner.lock().unwrap();
-        if inner.epoch != job.epoch {
-            return;
-        }
-        inner.generation += 1;
-        let generation = inner.generation;
-        let bitmap = finished_bitmap(job, rasterized, generation);
-        log::debug!(
-            "[subs] rasterized cue inline gen={} {}x{} at {}x{}",
-            generation, bitmap.width, bitmap.height, bitmap.target_w, inner.target_h
-        );
-        inner.ready.push(std::sync::Arc::new(bitmap));
-        if inner.ready.len() > READY_SLOTS {
-            inner.ready.remove(0);
-        }
+        inner.store_baked(job, rasterized, bake_ms);
     }
 }
 
@@ -1423,6 +1585,7 @@ impl Drop for SubtitleOverlay {
 /// releases it atomically, so a notify can't slip in between the check and
 /// the wait.
 fn raster_worker(shared: Arc<Shared>) {
+    ass::background_priority();
     loop {
         let job = {
             let mut inner = shared.inner.lock().unwrap();
@@ -1444,30 +1607,46 @@ fn raster_worker(shared: Arc<Shared>) {
         };
 
         // Lock released: this is the multi-millisecond part.
+        let started = crate::rt::Instant::now();
         let rasterized = bake(&job);
+        let bake_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         let mut inner = shared.inner.lock().unwrap();
         if inner.shutdown {
             return;
         }
+        inner.store_baked(job, rasterized, bake_ms);
+        // Loop round: the other wanted cue may still need baking.
+    }
+}
+
+impl Inner {
+    /// File a finished job (worker or inline): into `ready`, and for an
+    /// ASS frame into the bake-time average and the render scale.
+    fn store_baked(&mut self, job: RasterJob, rasterized: Baked, bake_ms: f64) {
         // A resize or a restyle while we were working invalidates the
         // result — `ready` was cleared, and storing this would hand the
         // render path a bitmap for the wrong geometry.
-        if inner.epoch != job.epoch {
-            continue;
+        if self.epoch != job.epoch {
+            return;
         }
-        inner.generation += 1;
-        let generation = inner.generation;
+        if let Some(a) = &job.ass {
+            self.ass_bake_ms = if self.ass_bake_ms > 0.0 { self.ass_bake_ms * 0.8 + bake_ms * 0.2 } else { bake_ms };
+            if a.brief {
+                self.adapt_ass_scale();
+            }
+        }
+        self.generation += 1;
+        let generation = self.generation;
         let bitmap = finished_bitmap(job, rasterized, generation);
         log::debug!(
             "[subs] rasterized cue gen={} {}x{} at {}x{}",
-            generation, bitmap.width, bitmap.height, bitmap.target_w, inner.target_h
+            generation, bitmap.width, bitmap.height, bitmap.target_w, self.target_h
         );
-        inner.ready.push(std::sync::Arc::new(bitmap));
-        if inner.ready.len() > READY_SLOTS {
-            inner.ready.remove(0);
+        self.ready.push(std::sync::Arc::new(bitmap));
+        if self.ready.len() > READY_SLOTS {
+            self.ready.remove(0);
         }
-        // Loop round: the other wanted cue may still need baking.
     }
 }
 
@@ -1495,6 +1674,12 @@ struct AssJob {
     frame: ass::Frame,
     /// Forget earlier collision placements first (after a seek).
     relayout: bool,
+    /// Rendered at this fraction of the picture size (see
+    /// `Inner::ass_scale`).
+    scale: f32,
+    /// Replaced soon (animation, frame-by-frame signs): the frames the
+    /// render scale adapts to.
+    brief: bool,
 }
 
 /// A job's output.
@@ -1516,13 +1701,28 @@ fn bake(job: &RasterJob) -> Baked {
             }
             let started = crate::rt::Instant::now();
             let imgs = r.render(&a.script, &a.show.key.events, a.show.time_ms, a.frame);
+            let rendered = crate::rt::Instant::now();
             let out = ass::composite(&imgs, a.frame.width, a.frame.height);
+            let render_ms = rendered.duration_since(started).as_secs_f64() * 1000.0;
+            let composite_ms = rendered.elapsed().as_secs_f64() * 1000.0;
             log::trace!(
-                "[subs/ass] {} events -> {} images in {:?}",
+                "[subs/ass] {} events -> {} images in {:.1} + {:.1} ms",
                 a.show.key.events.len(),
                 imgs.len(),
-                started.elapsed()
+                render_ms,
+                composite_ms
             );
+            let px = out.as_ref().map_or(0, |c| c.width as u64 * c.height as u64);
+            ass_perf(|p| {
+                p.frames += 1;
+                p.render_ms += render_ms;
+                p.render_max_ms = p.render_max_ms.max(render_ms + composite_ms);
+                p.composite_ms += composite_ms;
+                p.max_events = p.max_events.max(a.show.key.events.len());
+                p.max_images = p.max_images.max(imgs.len());
+                p.max_px = p.max_px.max(px);
+                p.min_scale = p.min_scale.min(a.scale);
+            });
             Baked::Ass(out)
         }
     }
@@ -1537,10 +1737,23 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
             return None;
         }
         let font = inner.font.as_ref()?;
-        for show in inner.ass_wanted(inner.current_pts_ms).into_iter().flatten() {
+        let pts = inner.current_pts_ms;
+        for (k, show) in inner.ass_wanted(pts).into_iter().enumerate() {
+            let Some(show) = show else { continue };
+            // A frame due now that a held frame already stands in for and
+            // that is replaced before it could be baked (animation, or
+            // frame-by-frame signs): bake the one the prefetch aims at.
+            if k == 0 && inner.held_ass(pts).is_some() && inner.ass_now_superseded(&show, pts) {
+                continue;
+            }
             if inner.ready_for_ass(&show.key).is_none() {
                 let storage = (inner.video_w > 0).then_some((inner.video_w, inner.video_h));
-                let frame = ass::frame_for(&track.script, inner.picture_w, inner.picture_h, storage, inner.style.size_scale as f64);
+                // Reduced resolution only for frames that are soon
+                // replaced; a line of dialogue that stays up is sharp.
+                let brief = show.key.tick >= 0 || inner.ass_next_edge(show.time_ms).is_some_and(|e| e - show.time_ms < 500);
+                let scale = ass_render_cap(inner.picture_w, inner.picture_h) * if brief { inner.ass_scale } else { 1.0 };
+                let (fw, fh) = ((inner.picture_w as f32 * scale).round() as u32, (inner.picture_h as f32 * scale).round() as u32);
+                let frame = ass::frame_for(&track.script, fw.max(1), fh.max(1), storage, inner.style.size_scale as f64);
                 return Some(RasterJob {
                     fonts: rasterizer::FontSet { primary: Arc::clone(font), fallback: inner.fallback.clone() },
                     text: String::new(),
@@ -1555,6 +1768,8 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
                         renderer: Arc::clone(&inner.ass_renderer),
                         frame,
                         relayout: inner.ass_relayout,
+                        scale,
+                        brief,
                     }),
                 });
             }
@@ -1595,12 +1810,12 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
     let rasterized = match baked {
         Baked::Text(r) => r,
         Baked::Ass(c) => {
-            let (key, time_ms) = match job.ass {
-                Some(a) => (Some(a.show.key), a.show.time_ms),
-                None => (None, 0),
+            let (key, time_ms, ass_scale) = match job.ass {
+                Some(a) => (Some(a.show.key), a.show.time_ms, 1.0 / a.scale),
+                None => (None, 0, 1.0),
             };
             let (width, height, rgba, origin) = match c {
-                Some(c) => (c.width, c.height, c.rgba, Some((c.left as f32, c.top as f32))),
+                Some(c) => (c.width, c.height, c.rgba, Some((c.left as f32 * ass_scale, c.top as f32 * ass_scale))),
                 None => (0, 0, Vec::new(), None),
             };
             return SubtitleBitmap {
@@ -1611,6 +1826,7 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
                 line_height_px: 0,
                 layout: CueLayout::DEFAULT,
                 origin,
+                scale: ass_scale,
                 text: String::new(),
                 target_w: job.target_w,
                 ass_key: key,
@@ -1630,6 +1846,7 @@ fn finished_bitmap(job: RasterJob, baked: Baked, generation: u64) -> SubtitleBit
         line_height_px,
         layout: job.layout,
         origin: None,
+        scale: 1.0,
         text: job.text,
         target_w: job.target_w,
         ass_key: None,
@@ -1665,6 +1882,10 @@ mod tests {
         Inner {
             cues: sorted,
             current_pts_ms: 0,
+            frame_ms: 0.0,
+            ass_bake_ms: 0.0,
+            ass_scale: 1.0,
+            ass_scale_age: 0,
             font: None,
             fallback: None,
             style: SubtitleStyle::DEFAULT,
@@ -1792,6 +2013,7 @@ mod tests {
             line_height_px: 1,
             layout: CueLayout::DEFAULT,
             origin: None,
+            scale: 1.0,
             text: "first".to_string(),
             target_w: 1920,
             ass_key: None,
@@ -1962,7 +2184,7 @@ mod tests {
         assert_eq!(inner.active_index(19_000), Some(1));
     }
 
-    fn bitmap(w: u32, h: u32, lh: u32, settings: &str) -> SubtitleBitmap {
+    pub(super) fn bitmap(w: u32, h: u32, lh: u32, settings: &str) -> SubtitleBitmap {
         SubtitleBitmap {
             rgba: Vec::new(),
             width: w,
@@ -1971,6 +2193,7 @@ mod tests {
             line_height_px: lh,
             layout: CueLayout::parse(settings),
             origin: None,
+            scale: 1.0,
             text: String::new(),
             target_w: 0,
             ass_key: None,
@@ -2366,9 +2589,91 @@ mod gpu_tests {
     }
 
     #[test]
+    fn a_typeset_script_keeps_every_event() {
+        // Frame-by-frame typesetting: one event per sign per 42 ms frame.
+        let events: String = (0..12_000)
+            .map(|i| {
+                let t = |ms: i64| format!("0:{:02}:{:02}.{:02}", ms / 60_000, ms / 1000 % 60, ms / 10 % 100);
+                format!("Dialogue: 0,{},{},Default,,0,0,0,,{{\\pos(320,180)}}sign {i}\n", t(i * 42), t(i * 42 + 42))
+            })
+            .collect();
+        let mut inner = super::tests::inner_with(Vec::new());
+        inner.add_cues(ass_cues(&events));
+        assert_eq!(inner.cues.len(), 12_000);
+        assert_eq!(inner.ass_active(21), vec![0], "the first sign is still there");
+        assert_eq!(inner.ass_active(11_999 * 42 + 1), vec![11_999]);
+    }
+
+    #[test]
+    fn animated_ass_prefetches_the_next_video_frame() {
+        let mut inner = super::tests::inner_with(ass_cues("Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(500,0)}Sign\n"));
+        let script = inner.cues.iter().find_map(|c| c.ass.as_ref().map(|a| Arc::clone(&a.script))).unwrap();
+        let animated = script.events.iter().map(event_animates).collect();
+        inner.ass = Some(AssTrack { script, animated });
+        inner.frame_ms = 41.7;
+        let [now, next] = inner.ass_wanted(1000);
+        assert_eq!(now.unwrap().key.tick, 1000);
+        assert_eq!(next.unwrap().key.tick, 1042);
+        // A 60 ms bake can't make the next frame: aim at the one after.
+        inner.ass_bake_ms = 60.0;
+        assert_eq!(inner.ass_wanted(1000)[1].as_ref().unwrap().key.tick, 1083);
+    }
+
+    #[test]
+    fn ass_render_size_is_capped_and_adapts() {
+        assert_eq!(ass_render_cap(1920, 858), 1.0);
+        assert_eq!(ass_render_cap(3840, 1607), 0.5);
+        assert_eq!(ass_render_cap(3840, 2160), 0.5);
+        let mut inner = super::tests::inner_with(Vec::new());
+        inner.frame_ms = 41.7;
+        // Slow bakes step the scale down to its floor ...
+        inner.ass_bake_ms = 200.0;
+        for _ in 0..200 {
+            inner.adapt_ass_scale();
+        }
+        assert_eq!(inner.ass_scale, 0.5);
+        // ... and fast ones back up to 1.
+        inner.ass_bake_ms = 10.0;
+        for _ in 0..200 {
+            inner.adapt_ass_scale();
+        }
+        assert_eq!(inner.ass_scale, 1.0);
+    }
+
+    #[test]
+    fn a_reduced_ass_frame_is_drawn_at_picture_size() {
+        let mut b = super::tests::bitmap(960, 429, 0, "");
+        b.origin = Some((100.0, 50.0));
+        b.scale = 2.0;
+        let p = CueParent::fit(1920, 858, 1920, 858, 0, SubtitleAnchor::Picture);
+        let q = cue_quad(&b, &p);
+        // full picture width, centred
+        assert!((q[2] - 1.0).abs() < 1e-6 && (q[0] - (100.0 + 960.0) / 960.0 + 1.0).abs() < 1e-6, "{q:?}");
+    }
+
+    #[test]
+    fn frame_by_frame_signs_are_prefetched_a_bake_ahead() {
+        // A static sign re-timed every 50 ms (a new event per frame).
+        let events: String = (0..40)
+            .map(|i| format!("Dialogue: 0,0:00:{:02}.{:02},0:00:{:02}.{:02},Default,,0,0,0,,{{\\pos(320,{i})}}sign\n", i * 5 / 100, i * 5 % 100, (i + 1) * 5 / 100, (i + 1) * 5 % 100))
+            .collect();
+        let mut inner = super::tests::inner_with(Vec::new());
+        inner.add_cues(ass_cues(&events));
+        let [now, next] = inner.ass_wanted(1010);
+        assert_eq!(next.as_ref().unwrap().time_ms, 1050, "fast bakes: the next edge");
+        assert!(!inner.ass_now_superseded(now.as_ref().unwrap(), 1010));
+        // 120 ms bakes: the sign on screen 150 ms from now; the current one
+        // is gone before it could be baked.
+        inner.ass_bake_ms = 120.0;
+        let [now, next] = inner.ass_wanted(1010);
+        assert_eq!(next.unwrap().time_ms, 1160);
+        assert!(inner.ass_now_superseded(now.as_ref().unwrap(), 1010));
+    }
+
+    #[test]
     fn ass_holds_the_last_frame_until_the_new_one_is_baked() {
         // An animated sign (fades in) under a line of static dialogue that
-        // starts mid-tick.
+        // starts between two video frames.
         let mut inner = super::tests::inner_with(ass_cues(
             "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(500,0)}Sign\n\
              Dialogue: 0,0:00:01.01,0:00:03.00,Default,,0,0,0,,Dialogue\n",
@@ -2386,6 +2691,7 @@ mod gpu_tests {
                 line_height_px: 0,
                 layout: CueLayout::DEFAULT,
                 origin: Some((0.0, 0.0)),
+                scale: 1.0,
                 text: String::new(),
                 target_w: 1920,
                 ass_key: Some(show.key),
@@ -2393,10 +2699,13 @@ mod gpu_tests {
             }));
         };
         baked(&mut inner, 990);
-        // 1015 ms: same tick as 990, but the dialogue has started — a key
-        // nobody prefetched. The sign frame from 990 stays up meanwhile.
+        // A frame baked for 2 ms off stands in (the prefetch predicts the
+        // next frame time from the average interval).
+        assert_eq!(inner.shown_bitmap(992, 1920).unwrap().ass_time_ms, 990);
+        // 1015 ms: the dialogue has started — a key nobody prefetched. The
+        // sign frame from 990 stays up meanwhile.
         let held = inner.shown_bitmap(1015, 1920).expect("held frame");
-        assert_eq!(held.ass_time_ms, 990 - 990 % ASS_TICK_MS);
+        assert_eq!(held.ass_time_ms, 990);
         // Once baked, the exact frame wins.
         baked(&mut inner, 1015);
         let shown = inner.shown_bitmap(1015, 1920).unwrap();
@@ -2422,8 +2731,8 @@ mod gpu_tests {
         ));
         let at = |pts: i64| -> u8 {
             overlay.set_pts_ms(pts);
-            // the tick a frame shows starts at most ASS_TICK_MS before pts
-            let want = ((pts - pts % ASS_TICK_MS) as f64 / 1000.0 * 255.0) as i32;
+            // rendered for the frame's own time
+            let want = (pts as f64 / 1000.0 * 255.0) as i32;
             let px = wait_frame(&dev, &queue, &overlay, &target, |p| (p[((50 * W + 50) * 4) as usize] as i32 - want).abs() <= 2);
             px[((50 * W + 50) * 4) as usize]
         };

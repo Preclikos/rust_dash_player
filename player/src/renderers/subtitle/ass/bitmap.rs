@@ -69,11 +69,9 @@ pub fn union(a: Option<Bitmap>, b: Option<Bitmap>) -> Option<Bitmap> {
             let bt = (a.top + a.h).max(b.top + b.h);
             let mut out = Bitmap::new(l, t, r - l, bt - t);
             for src in [&a, &b] {
-                for y in 0..src.h {
-                    let row = ((src.top - t + y) * out.w + (src.left - l)) as usize;
-                    for x in 0..src.w as usize {
-                        let v = src.data[(y * src.w) as usize + x];
-                        let d = &mut out.data[row + x];
+                for (y, s) in src.data.chunks_exact(src.w as usize).enumerate() {
+                    let row = ((src.top - t + y as i32) * out.w + (src.left - l)) as usize;
+                    for (d, &v) in out.data[row..row + s.len()].iter_mut().zip(s) {
                         *d = (*d).max(v);
                     }
                 }
@@ -86,18 +84,20 @@ pub fn union(a: Option<Bitmap>, b: Option<Bitmap>) -> Option<Bitmap> {
 /// libass `add_bitmaps` (saturating), `src` placed at its own position
 /// inside `dst`'s rectangle (which must contain it).
 pub fn add_into(dst: &mut Bitmap, src: &Bitmap, dx: i32, dy: i32) {
+    let ox = src.left + dx - dst.left;
+    let (x0, x1) = ((-ox).max(0), (dst.w - ox).min(src.w));
+    if x1 <= x0 {
+        return;
+    }
     for y in 0..src.h {
         let ty = src.top + dy + y - dst.top;
         if ty < 0 || ty >= dst.h {
             continue;
         }
-        for x in 0..src.w {
-            let tx = src.left + dx + x - dst.left;
-            if tx < 0 || tx >= dst.w {
-                continue;
-            }
-            let d = &mut dst.data[(ty * dst.w + tx) as usize];
-            *d = (*d as u32 + src.data[(y * src.w + x) as usize] as u32).min(255) as u8;
+        let s = &src.data[(y * src.w + x0) as usize..(y * src.w + x1) as usize];
+        let d0 = (ty * dst.w + ox + x0) as usize;
+        for (d, &v) in dst.data[d0..d0 + s.len()].iter_mut().zip(s) {
+            *d = d.saturating_add(v);
         }
     }
 }
@@ -175,68 +175,82 @@ pub fn synth_blur(bm: &mut Bitmap, be: i32, r2x: f64, r2y: f64) {
     be_blur_pass(bm);
 }
 
-fn gauss_kernel(r2: f64) -> Vec<f32> {
+/// Gaussian taps 0..=radius in 1/65536, the full kernel summing to 65536.
+fn gauss_kernel(r2: f64) -> Vec<u32> {
     if r2 <= 0.001 {
-        return vec![1.0];
+        return vec![65536];
     }
     let sigma = r2.sqrt();
     let radius = (4.0 * sigma).ceil().max(1.0) as usize;
-    let mut k: Vec<f64> = (0..=radius).map(|i| (-((i * i) as f64) / (2.0 * r2)).exp()).collect();
+    let k: Vec<f64> = (0..=radius).map(|i| (-((i * i) as f64) / (2.0 * r2)).exp()).collect();
     let sum: f64 = k[0] + 2.0 * k[1..].iter().sum::<f64>();
-    for v in &mut k {
-        *v /= sum;
-    }
-    k.into_iter().map(|v| v as f32).collect()
+    let mut q: Vec<u32> = k.iter().map(|v| (v / sum * 65536.0).round() as u32).collect();
+    // the centre tap takes the rounding so the kernel sums to exactly 1
+    let side: u32 = q[1..].iter().sum();
+    q[0] = 65536 - 2 * side;
+    q
 }
 
 /// Separable gaussian; the bitmap grows by the kernel radius on each side.
+/// Fixed point (integer math vectorizes on every target, 32-bit ARM
+/// included): the horizontal pass keeps 8 fractional bits in `u16`, the
+/// vertical one accumulates in `u32` and rounds once. Both run over whole
+/// rows as plain slices.
 pub fn gaussian_blur(bm: &mut Bitmap, r2x: f64, r2y: f64) {
     let kx = gauss_kernel(r2x);
     let ky = gauss_kernel(r2y);
-    let (rx, ry) = (kx.len() as i32 - 1, ky.len() as i32 - 1);
-    let (w, h) = (bm.w + 2 * rx, bm.h + 2 * ry);
-    // Horizontal pass into a float buffer of the grown width.
-    let mut tmp = vec![0f32; (w * bm.h) as usize];
-    for y in 0..bm.h {
-        let row = &bm.data[(y * bm.w) as usize..((y + 1) * bm.w) as usize];
-        let out = &mut tmp[(y * w) as usize..((y + 1) * w) as usize];
-        for (x, &v) in row.iter().enumerate() {
-            if v == 0 {
-                continue;
+    let (rx, ry) = (kx.len() - 1, ky.len() - 1);
+    let (bw, bh) = (bm.w as usize, bm.h as usize);
+    let (w, h) = (bw + 2 * rx, bh + 2 * ry);
+    // Horizontal: out[x] = Σ k[|j|]·src[x − rx − j], the source row at 2·rx
+    // in a zero-padded buffer so every tap is a slice. 255·65536 fits u32.
+    let mut tmp = vec![0u16; w * bh];
+    let mut padded = vec![0u32; bw + 4 * rx];
+    let mut acc = vec![0u32; w];
+    for (y, row) in bm.data.chunks_exact(bw).enumerate() {
+        if row.iter().all(|&v| v == 0) {
+            continue;
+        }
+        for (d, &v) in padded[2 * rx..2 * rx + bw].iter_mut().zip(row) {
+            *d = v as u32;
+        }
+        for (o, &v) in acc.iter_mut().zip(&padded[rx..rx + w]) {
+            *o = kx[0] * v;
+        }
+        for (i, &k) in kx.iter().enumerate().skip(1) {
+            let (a, b) = (&padded[rx - i..rx - i + w], &padded[rx + i..rx + i + w]);
+            for ((o, &a), &b) in acc.iter_mut().zip(a).zip(b) {
+                *o += k * (a + b);
             }
-            let v = v as f32;
-            let c = x as i32 + rx;
-            for (i, &kv) in kx.iter().enumerate() {
-                let i = i as i32;
-                out[(c + i) as usize] += v * kv;
-                if i > 0 {
-                    out[(c - i) as usize] += v * kv;
+        }
+        for (t, &v) in tmp[y * w..(y + 1) * w].iter_mut().zip(&acc) {
+            *t = ((v + 128) >> 8) as u16;
+        }
+    }
+    // Vertical: out row y = Σ k[|j|]·tmp row (y − ry − j); 65280·65536
+    // still fits u32.
+    let mut out = vec![0u32; w * h];
+    for (sy, src) in tmp.chunks_exact(w).enumerate() {
+        if src.iter().all(|&v| v == 0) {
+            continue;
+        }
+        // source row sy lands on output rows sy .. sy + 2·ry
+        for (j, &k) in ky.iter().enumerate() {
+            for y in [sy + ry - j, sy + ry + j] {
+                for (o, &v) in out[y * w..(y + 1) * w].iter_mut().zip(src) {
+                    *o += k * v as u32;
+                }
+                if j == 0 {
+                    break;
                 }
             }
         }
     }
-    let mut out = vec![0f32; (w * h) as usize];
-    for y in 0..bm.h {
-        let c = y + ry;
-        for x in 0..w {
-            let v = tmp[(y * w + x) as usize];
-            if v == 0.0 {
-                continue;
-            }
-            for (i, &kv) in ky.iter().enumerate() {
-                let i = i as i32;
-                out[((c + i) * w + x) as usize] += v * kv;
-                if i > 0 {
-                    out[((c - i) * w + x) as usize] += v * kv;
-                }
-            }
-        }
-    }
-    bm.left -= rx;
-    bm.top -= ry;
-    bm.w = w;
-    bm.h = h;
-    bm.data = out.into_iter().map(|v| (v + 0.5).clamp(0.0, 255.0) as u8).collect();
+    bm.left -= rx as i32;
+    bm.top -= ry as i32;
+    bm.w = w as i32;
+    bm.h = h as i32;
+    bm.data = out.into_iter().map(|v| ((v as u64 + (1 << 23)) >> 24).min(255) as u8).collect();
 }
 
 /// libass `ass_fix_outline`: take the glyph out of the border underneath it.
@@ -248,10 +262,14 @@ pub fn fix_outline(g: &Bitmap, o: &mut Bitmap) {
     let t = o.top.max(g.top);
     let r = (o.left + o.w).min(g.left + g.w);
     let b = (o.top + o.h).min(g.top + g.h);
+    if r <= l {
+        return;
+    }
+    let n = (r - l) as usize;
     for y in t..b {
-        for x in l..r {
-            let gv = g.data[((y - g.top) * g.w + (x - g.left)) as usize];
-            let ov = &mut o.data[((y - o.top) * o.w + (x - o.left)) as usize];
+        let gi = ((y - g.top) * g.w + (l - g.left)) as usize;
+        let oi = ((y - o.top) * o.w + (l - o.left)) as usize;
+        for (ov, &gv) in o.data[oi..oi + n].iter_mut().zip(&g.data[gi..gi + n]) {
             *ov = if *ov > gv { *ov - gv / 2 } else { 0 };
         }
     }
@@ -280,11 +298,15 @@ pub fn shift(bm: &mut Bitmap, sx: i32, sy: i32) {
         }
     }
     if sy != 0 {
-        for x in 0..w as usize {
-            for y in (1..h as usize).rev() {
-                let b = ((g.data[x + y * s - s] as i32 * sy) >> 6) as u8;
-                g.data[x + y * s - s] -= b;
-                g.data[x + y * s] = g.data[x + y * s].saturating_add(b);
+        // Columns are independent: bottom-up row by row is the same as
+        // column by column.
+        for y in (1..h as usize).rev() {
+            let (above, below) = g.data.split_at_mut(y * s);
+            let above = &mut above[(y - 1) * s..];
+            for (a, d) in above.iter_mut().zip(&mut below[..s]) {
+                let b = ((*a as i32 * sy) >> 6) as u8;
+                *a -= b;
+                *d = d.saturating_add(b);
             }
         }
     }

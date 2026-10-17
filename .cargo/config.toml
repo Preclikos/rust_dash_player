@@ -12,8 +12,10 @@
 [target.aarch64-linux-android]
 rustflags = ["-C", "target-feature=+aes,+neon", "--cfg", "aes_armv8", "-C", "link-arg=-Wl,--build-id=sha1"]
 
+# armeabi-v7a requires NEON (NDK r21+, every API 26 device); rustc's
+# armv7 Android target leaves it off, and without it no loop vectorizes.
 [target.armv7-linux-androideabi]
-rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]
+rustflags = ["-C", "target-feature=+neon", "-C", "link-arg=-Wl,--build-id=sha1"]
 
 [target.x86_64-linux-android]
 rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]

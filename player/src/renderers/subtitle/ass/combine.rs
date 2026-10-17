@@ -63,6 +63,9 @@ struct Combined {
     effect_type: Effect,
     effect_timing: i32,
     leftmost_x: f64,
+    /// How far (px) blur, `\be` and the shadow spread a glyph's bitmaps;
+    /// `None` = never cull (opaque boxes).
+    spread: Option<(f64, f64)>,
     /// Subpixel residual of the run's first glyph (see `snap`).
     residual: Option<(f64, f64)>,
     glyphs: Vec<Bitmap>,
@@ -191,16 +194,93 @@ fn snap(m: &[[f64; 3]; 3], o: &Outline, residual: &mut Option<(f64, f64)>, first
     Some((q.0 * 8.0 - cx, q.1 * 8.0 - cy))
 }
 
+/// A glyph whose bitmaps, grown by its border (`bord`, glyph space 26.6)
+/// and `spread` (px), cannot reach the frame. libass renders such glyphs
+/// too; skipping them changes nothing on screen and keeps an event that
+/// runs far off the frame (a page of text, a long `\move`) from
+/// rasterizing all of it. Affine transforms only.
+fn off_frame(st: &State<'_>, m: &[[f64; 3]; 3], o: &Outline, shift: (f64, f64), bord: (f64, f64), spread: (f64, f64)) -> bool {
+    if m[2][0] != 0.0 || m[2][1] != 0.0 || m[2][2] <= 0.0 {
+        return false;
+    }
+    let Some(c) = o.cbox() else { return true };
+    let w = 1.0 / m[2][2];
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for (x, y) in [(c.x_min, c.y_min), (c.x_max, c.y_min), (c.x_min, c.y_max), (c.x_max, c.y_max)] {
+        let sx = (m[0][0] * x + m[0][1] * y + m[0][2]) * w + shift.0;
+        let sy = (m[1][0] * x + m[1][1] * y + m[1][2]) * w + shift.1;
+        x0 = x0.min(sx);
+        x1 = x1.max(sx);
+        y0 = y0.min(sy);
+        y1 = y1.max(sy);
+    }
+    let bx = (m[0][0].abs() * bord.0 + m[0][1].abs() * bord.1) * w;
+    let by = (m[1][0].abs() * bord.0 + m[1][1].abs() * bord.1) * w;
+    let mx = bx / 64.0 + spread.0 + 2.0;
+    let my = by / 64.0 + spread.1 + 2.0;
+    x1 / 64.0 + mx < 0.0 || x0 / 64.0 - mx > st.frame.width as f64 || y1 / 64.0 + my < 0.0 || y0 / 64.0 - my > st.frame.height as f64
+}
+
 fn placed(o: &Outline, m: &[[f64; 3]; 3], shift: (f64, f64)) -> Outline {
     outline::transform_3d(o, m).map(|p| P::new(p.x + shift.0, p.y + shift.1))
 }
 
+/// The bitmap of `outline` (with `stroked`: the border, glyph ∪ stroke)
+/// placed by `m` + `shift`, through the bitmap cache when the transform is
+/// affine.
+fn raster(
+    caches: &mut Caches,
+    outline: &Arc<Outline>,
+    stroked: Option<&Arc<Outline>>,
+    m: &[[f64; 3]; 3],
+    shift: (f64, f64),
+) -> Option<Bitmap> {
+    let draw = |m: &[[f64; 3]; 3], shift: (f64, f64)| {
+        let fill = bitmap::fill(&placed(outline, m, shift));
+        match stroked {
+            Some(s) => bitmap::union(fill, bitmap::fill(&placed(s, m, shift))),
+            None => fill,
+        }
+    };
+    if m[2][0] != 0.0 || m[2][1] != 0.0 || m[2][2] < 0.1 {
+        return draw(m, shift);
+    }
+    let w = 1.0 / m[2][2];
+    let lin = [m[0][0] * w, m[0][1] * w, m[1][0] * w, m[1][1] * w];
+    let (tx, ty) = (m[0][2] * w + shift.0, m[1][2] * w + shift.1);
+    let (ix, iy) = ((tx / 64.0).floor(), (ty / 64.0).floor());
+    let (fx, fy) = (((tx - ix * 64.0) * 16.0).round() as i32, ((ty - iy * 64.0) * 16.0).round() as i32);
+    let key = (
+        Arc::as_ptr(outline) as usize,
+        stroked.map_or(0, |s| Arc::as_ptr(s) as usize),
+        lin.map(f64::to_bits),
+        fx,
+        fy,
+    );
+    let bm = match caches.bitmap(&key) {
+        Some(bm) => bm,
+        None => {
+            let unit = [[lin[0], lin[1], fx as f64 / 16.0], [lin[2], lin[3], fy as f64 / 16.0], [0.0, 0.0, 1.0]];
+            let bm = draw(&unit, (0.0, 0.0)).map(Arc::new);
+            caches.put_bitmap(key, outline, stroked, bm.clone());
+            bm
+        }
+    }?;
+    let mut out = (*bm).clone();
+    out.left += ix as i32;
+    out.top += iy as i32;
+    Some(out)
+}
+
 /// libass `get_bitmap_glyph`: the part's fill and border bitmaps.
+#[allow(clippy::too_many_arguments)]
 fn glyph_bitmaps(
     st: &State<'_>,
+    caches: &mut Caches,
     g: &Glyph,
     p: &Part,
     flags: u32,
+    spread: Option<(f64, f64)>,
     leftmost_x: &mut f64,
     residual: &mut Option<(f64, f64)>,
 ) -> (Option<Bitmap>, Option<Bitmap>) {
@@ -220,7 +300,17 @@ fn glyph_bitmaps(
     }
     let first = residual.is_none();
     let Some(shift) = snap(&m2, outline, residual, first) else { return (None, None) };
-    let bm = bitmap::fill(&placed(outline, &m2, shift));
+    if let Some(spread) = spread {
+        let bord = if flags & F_NONZERO_BORDER != 0 {
+            (64.0 * st.border_scale_x * g.border_x / p.scale.0 / st.frame.par, 64.0 * st.border_scale_y * g.border_y / p.scale.1)
+        } else {
+            (0.0, 0.0)
+        };
+        if off_frame(st, &m2, outline, shift, (bord.0.abs(), bord.1.abs()), spread) {
+            return (None, None);
+        }
+    }
+    let bm = raster(caches, outline, None, &m2, shift);
 
     if flags & F_BORDER_STYLE_3 != 0 {
         if flags & (F_NONZERO_BORDER | F_NONZERO_SHADOW) == 0 {
@@ -261,11 +351,10 @@ fn glyph_bitmaps(
     if px_x < 1.0 / 128.0 && px_y < 1.0 / 128.0 {
         return (bm.clone(), bm);
     }
-    let stroked = outline::stroke(outline, bord_x.max(0.0), bord_y.max(0.0));
+    let stroked = caches.stroke(outline, bord_x.max(0.0), bord_y.max(0.0));
     // libass snaps the border outline by its own control box.
     let bshift = snap(&m2, &stroked, residual, false).unwrap_or(shift);
-    let so = bitmap::fill(&placed(&stroked, &m2, bshift));
-    let bo = bitmap::union(bitmap::fill(&placed(outline, &m2, bshift)), so);
+    let bo = raster(caches, outline, Some(&stroked), &m2, bshift);
     (bm, bo)
 }
 
@@ -400,8 +489,14 @@ pub fn render(text: &mut Text, st: &State<'_>, caches: &mut Caches) -> Vec<Image
                 } else {
                     (0, 0)
                 };
+                let spread = (g.border_style != 3).then(|| {
+                    let extent = |q: i32| restore_blur(q).sqrt() * 4.0 + 1.0;
+                    let be = g.be.max(0) as f64 + bitmap::be_padding(g.be) as f64;
+                    (extent(blur_x) + be + (shadow.0.abs() as f64 / 64.0).ceil(), extent(blur_y) + be + (shadow.1.abs() as f64 / 64.0).ceil())
+                });
                 runs.push(Combined {
                     flags,
+                    spread,
                     be: g.be,
                     blur_x,
                     blur_y,
@@ -427,7 +522,7 @@ pub fn render(text: &mut Text, st: &State<'_>, caches: &mut Caches) -> Vec<Image
             let g = &text.glyphs[gi];
             let p = &g.parts[pi];
             let run = runs.last_mut().unwrap();
-            let (bm, bo) = glyph_bitmaps(st, g, p, run.flags, &mut run.leftmost_x, &mut run.residual);
+            let (bm, bo) = glyph_bitmaps(st, caches, g, p, run.flags, run.spread, &mut run.leftmost_x, &mut run.residual);
             if let Some(b) = bm {
                 run.glyphs.push(b);
             }

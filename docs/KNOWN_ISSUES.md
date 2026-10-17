@@ -165,11 +165,18 @@ These are not bugs in the player, but breaking them reproduces old bugs.
 
 ## ASS subtitles: what differs from libass or is not verified
 
-- **Not on devices yet.** The renderer and the overlay path are covered by
-  unit, GPU and golden tests on Windows; Android, Apple and web have only
-  been built, not watched. Expect the first look on a TV SoC to be about the
-  worker's render time for heavy animated typesetting (~2 ms per 1080p frame
-  on a desktop CPU, release build).
+- **Heavy typesetting on weak TV SoCs.** Watched on Android (Galaxy S21,
+  Google TV Streamer) and in Chrome (Windows laptop); Apple is built, not
+  watched. A full-screen
+  karaoke OP (580 events per frame) renders in ~10 ms on the S21 and
+  30–60 ms on the Streamer's 4× Cortex-A55, which the render scale absorbs
+  (signs at down to half resolution); a Cortex-A35 stick (Mi Stick 4K) will
+  sit at half resolution and still drop animation frames there — the
+  previous frame stays up meanwhile, video is not affected.
+- **Legacy non-Unicode fonts.** Fonts with only a Big5 / Shift-JIS / legacy
+  Arabic charmap (old fansub fonts) are not re-encoded for the way libass
+  does; their text comes out as missing glyphs (libass-tests
+  `font_nonunicode`).
 - **`@Font` vertical alternates.** libass enables `vert`/`vkna` for `@Font`
   runs and so does the renderer, but the ffmpeg/libass build used for the
   golden references did not substitute the vertical form of `、` in MS Gothic
