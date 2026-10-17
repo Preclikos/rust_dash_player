@@ -430,11 +430,15 @@ impl AssRenderer {
             self.fixed.clear();
             self.fixed_frame = (frame.width, frame.height);
         }
-        let todo: Vec<usize> = active
+        let mut todo: Vec<usize> = active
             .iter()
             .copied()
             .filter(|&i| script.events.get(i).is_some_and(|e| e.start_ms <= time_ms && time_ms < e.end_ms()))
             .collect();
+        // Each event once: a duplicate would collide with itself and be
+        // pushed further away every frame.
+        todo.sort_unstable();
+        todo.dedup();
         let mut events = self.render_events(script, &todo, time_ms, frame);
         events.sort_by_key(|e| (e.layer, e.read_order));
         let mut start = 0;

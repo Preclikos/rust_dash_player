@@ -455,6 +455,24 @@ struct SurfaceHold {
     held: AtomicBool,
 }
 
+/// Playback held while a styled (ASS) subtitle track's script and fonts
+/// download: without them the frames would play with no subtitles, or with
+/// fallback faces that then jump to the real ones. The host sees
+/// `Buffering { TrackSwitch }`; `Playing` follows with the first frame
+/// after the release. A host `pause()` while held cancels the hold (the
+/// release then leaves playback paused).
+#[derive(Default)]
+struct SubtitleHold {
+    /// The hold paused playback (so it may resume it).
+    held: AtomicBool,
+    /// The subtitle selection it is for (see `Player::subtitle_selection`).
+    selection: AtomicU64,
+}
+
+/// Longest a subtitle download holds playback; then it plays on and the
+/// subtitles appear when they are in.
+const SUBTITLE_HOLD_MAX: Duration = Duration::from_secs(10);
+
 pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
     manifest: Option<Manifest>,
@@ -565,6 +583,11 @@ pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
     /// subtitles disabled — text_play won't spawn. Consumer toggles via
     /// `set_subtitle_track` / `clear_subtitle_track`.
     subtitle_representation: Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>,
+    /// Bumped by every `set_subtitle_track` / `clear_subtitle_track`: a
+    /// `text_play` started for an older selection queues nothing, even when
+    /// the same track was picked again (its cues would arrive twice).
+    subtitle_selection: Arc<AtomicU64>,
+    subtitle_hold: Arc<SubtitleHold>,
 
     /// Subtitle tracks the host added from its own bytes via
     /// `add_external_subtitle_track`, kept beside the manifest's rather
@@ -673,6 +696,8 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             video_switch_tx: Arc::clone(&self.video_switch_tx),
             buffer_config: Arc::clone(&self.buffer_config),
             subtitle_representation: Arc::clone(&self.subtitle_representation),
+            subtitle_selection: Arc::clone(&self.subtitle_selection),
+            subtitle_hold: Arc::clone(&self.subtitle_hold),
             external_text: Arc::clone(&self.external_text),
             next_external_id: Arc::clone(&self.next_external_id),
             video_output_window: Arc::clone(&self.video_output_window),
@@ -876,6 +901,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             video_switch_tx: Arc::new(StdMutex::new(None)),
             buffer_config: Arc::new(StdMutex::new(BufferConfig::default())),
             subtitle_representation: Arc::new(StdMutex::new(None)),
+            subtitle_selection: Arc::new(AtomicU64::new(0)),
+            subtitle_hold: Arc::new(SubtitleHold::default()),
             external_text: Arc::new(StdMutex::new(Vec::new())),
             next_external_id: Arc::new(AtomicU32::new(EXTERNAL_TEXT_ID_BASE)),
             video_output_window: Arc::new(DirectWindow::new()),
@@ -1192,6 +1219,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// audio output stops feeding the device. PTS does not advance.
     /// `Paused` event is emitted; no-op if already paused.
     pub fn pause(&self) {
+        // the host's pause outlives a subtitle hold
+        self.subtitle_hold.held.store(false, Ordering::SeqCst);
         if !self.paused.swap(true, Ordering::Relaxed) {
             self.audio_renderer.set_paused(true);
             let _ = self.events.send(PlayerEvent::Paused);
@@ -1938,7 +1967,9 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             info: text_track_info(representation),
         });
         // Wipe any cues from the previous track so they don't bleed
-        // across the switch.
+        // across the switch; a text_play still running for an earlier
+        // selection (even of this same track) stops queueing.
+        let selection = self.subtitle_selection.fetch_add(1, Ordering::SeqCst) + 1;
         self.video_renderer.clear_subtitles();
         log::info!(
             "[subs] selected representation id={} codecs={} mime={}",
@@ -1953,20 +1984,65 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let http = Arc::clone(&self.http);
         let sink = self.video_renderer.clone();
         let active = Arc::clone(&self.subtitle_representation);
-        let target_id = representation.id;
+        let target = (Arc::clone(&self.subtitle_selection), selection);
         let position_ms = Arc::clone(&self.position_ms);
+        // A styled track (one script file + its fonts) holds playback until
+        // it is in; segmented / host-supplied cues need no wait.
+        let hold = representation.is_ass() && representation.external_cues.is_none();
+        if hold {
+            self.subtitle_hold_begin(selection);
+        }
+        let release = self.clone();
         self.rt.spawn(async move {
-            let res = text_play(repr, stop_epoch, http, sink, active, target_id, position_ms).await;
+            let res = text_play(repr, stop_epoch, http, sink, active, target, position_ms).await;
             if let Err(e) = res {
                 log::warn!("[subs] text_play exited: {}", e);
             }
+            if hold {
+                release.subtitle_hold_end(selection, "subtitles in");
+            }
         });
+        if hold {
+            let release = self.clone();
+            self.rt.spawn(async move {
+                crate::rt::sleep(SUBTITLE_HOLD_MAX).await;
+                release.subtitle_hold_end(selection, "still downloading after 10 s, playing on");
+            });
+        }
+    }
+
+    /// Hold playback for subtitle selection `selection` (see [`SubtitleHold`]).
+    /// Nothing to hold when the host has playback paused.
+    fn subtitle_hold_begin(&self, selection: u64) {
+        let h = &self.subtitle_hold;
+        h.selection.store(selection, Ordering::SeqCst);
+        if self.paused.load(Ordering::SeqCst) && !h.held.load(Ordering::SeqCst) {
+            return;
+        }
+        if !self.paused.swap(true, Ordering::SeqCst) {
+            self.audio_renderer.set_paused(true);
+        }
+        h.held.store(true, Ordering::SeqCst);
+        log::info!("[subs] holding playback while the subtitle track downloads");
+        let _ = self.events.send(PlayerEvent::Buffering { reason: BufferingReason::TrackSwitch });
+    }
+
+    /// Release the hold for `selection` if it is still the one held.
+    fn subtitle_hold_end(&self, selection: u64, why: &str) {
+        let h = &self.subtitle_hold;
+        if h.selection.load(Ordering::SeqCst) != selection || !h.held.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        log::info!("[subs] releasing playback: {}", why);
+        self.resume();
     }
 
     /// Disable subtitles. Wipes the overlay's queued cues; any running
     /// `text_play` notices the cleared selection on its next segment
     /// boundary and exits cleanly.
     pub fn clear_subtitle_track(&self) {
+        let selection = self.subtitle_selection.fetch_add(1, Ordering::SeqCst);
+        self.subtitle_hold_end(selection, "subtitles off");
         *self.subtitle_representation.lock().unwrap() = None;
         self.video_renderer.clear_subtitles();
     }
@@ -3714,6 +3790,75 @@ hi
         *player.seek_target.write().await = Some(Duration::from_secs(1_300));
         player.set_start_position(Some(Duration::from_secs(1_250)));
         player.stop().await;
+    }
+
+    fn ass_track(url: &str) -> crate::tracks::text::TextRepresenation {
+        crate::tracks::text::TextRepresenation {
+            id: 7,
+            codecs: "ass".to_string(),
+            mime_type: "text/x-ssa".to_string(),
+            bandwidth: 1000,
+            base_url: String::new(),
+            file_url: url.to_string(),
+            segment_init: None,
+            segment_range: None,
+            segments: Vec::new(),
+            single_file_url: Some(url.to_string()),
+            external_cues: None,
+            fonts: Vec::new(),
+        }
+    }
+
+    /// A local server that answers every request 404 at once.
+    async fn not_found_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}/script.ass")
+    }
+
+    async fn wait_unpaused(player: &TestPlayer) -> bool {
+        for _ in 0..100 {
+            if !player.is_paused() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_styled_subtitle_track_holds_playback_while_it_downloads() {
+        let player = test_player();
+        let mut events = player.events();
+        // the download fails at once, which ends the hold
+        let url = not_found_server().await;
+        player.set_subtitle_track(&ass_track(&url));
+        assert!(player.is_paused(), "held while the script downloads");
+        let mut buffering = false;
+        while let Ok(e) = events.try_recv() {
+            buffering |= matches!(e, PlayerEvent::Buffering { reason: BufferingReason::TrackSwitch });
+        }
+        assert!(buffering, "the host is told it is buffering");
+        assert!(wait_unpaused(&player).await, "released once the download is over");
+
+        // A host pause during the hold stays.
+        player.set_subtitle_track(&ass_track(&url));
+        player.pause();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(player.is_paused(), "the host's pause outlives the hold");
+
+        // Already paused by the host: nothing to hold, nothing resumed.
+        player.set_subtitle_track(&ass_track(&url));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(player.is_paused());
     }
 
     #[tokio::test]

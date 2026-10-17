@@ -83,23 +83,25 @@ pub(super) async fn text_play<V: VideoSink>(
     http: Arc<HttpClient>,
     video_sink: Arc<V>,
     active: Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>,
-    target_id: u32,
+    // the player's selection counter and the value it had for this run
+    target: (Arc<AtomicU64>, u64),
     position_ms: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let epoch_at_start = stop_epoch.load(Ordering::SeqCst);
     let stopped = || stop_epoch.load(Ordering::SeqCst) != epoch_at_start;
-    // Helper: did the consumer change subtitle selection out from under us?
+    // Helper: did the consumer change subtitle selection out from under
+    // us? Any newer selection counts, the same track picked again too.
+    let target_id = text_representation.id;
     let still_selected = |active: &Arc<StdMutex<Option<crate::tracks::text::TextRepresenation>>>| -> bool {
-        active
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|r| r.id == target_id)
-            .unwrap_or(false)
+        target.0.load(Ordering::SeqCst) == target.1
+            && active.lock().unwrap().as_ref().is_some_and(|r| r.id == target_id)
     };
 
     // ---- host-supplied cues: already parsed, nothing to fetch ----
     if let Some(cues) = &text_representation.external_cues {
+        if !still_selected(&active) {
+            return Ok(());
+        }
         log::info!(
             "[subs] external track {} selected: {} cues",
             text_representation.id,

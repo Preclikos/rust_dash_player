@@ -3,6 +3,36 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.24
+
+### All platforms
+
+- **ASS lines no longer climb the screen.** Picking a subtitle track twice
+  (an automatic pick and then the host's, or the same track again) left two
+  downloads running; both queued their cues, so every event was on screen
+  twice and collision stacking pushed one copy above the other, a bit
+  further each frame (desktop and web hosts; libass/VLC were fine). A
+  download started for an older selection now queues nothing, the overlay
+  keeps each cue once, and the renderer each event once.
+- **Buffering while a styled track downloads.** Selecting an ASS track holds
+  playback (`Buffering { TrackSwitch }`) until its script and fonts are in,
+  instead of playing on with no subtitles or fallback faces; at most 10 s,
+  then it plays on and the subtitles appear when ready. A host `pause()`
+  during the hold stays paused.
+
+### Tests and tooling
+
+- `examples/desktop`: `t <i>` picks a manifest subtitle track, `t off`
+  turns subtitles off.
+
+## 0.2.23
+
+### Web (web only)
+
+- The npm package ships `snippets/` (the ASS worker's module locator), so
+  0.2.22's package resolves in bundlers; a module loaded from a `blob:` /
+  `data:` URL renders ASS on the page's thread instead of failing.
+
 ## 0.2.22
 
 ### All platforms

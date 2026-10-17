@@ -655,9 +655,30 @@ impl Inner {
                 self.invalidate();
             }
         }
+        // A file's cues come again whenever the text pipeline restarts
+        // (every seek, for a sidecar): keep each cue once. A duplicated
+        // ASS event used to collide with itself and climb the screen.
+        let key = |c: &VttCue| -> (i64, i64, u64) {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            match &c.ass {
+                Some(a) => (Arc::as_ptr(&a.script) as usize, a.event).hash(&mut h),
+                None => c.text.hash(&mut h),
+            }
+            (c.start_ms, c.end_ms, h.finish())
+        };
+        let mut known: std::collections::HashSet<(i64, i64, u64)> = self.cues.iter().map(key).collect();
+        let mut repeated = 0usize;
         for c in cues {
+            if !known.insert(key(&c)) {
+                repeated += 1;
+                continue;
+            }
             self.max_cue_span_ms = self.max_cue_span_ms.max(c.end_ms - c.start_ms);
             self.cues.push(c);
+        }
+        if repeated > 0 {
+            log::info!("[subs] {} cues queued again (already held) ignored", repeated);
         }
         self.cues.sort_by_key(|c| c.start_ms);
         // Cap memory for an endless (live) text stream: past this many
@@ -686,6 +707,7 @@ impl Inner {
             .filter_map(|c| c.ass.as_ref().map(|a| a.event))
             .collect();
         ev.sort_unstable();
+        ev.dedup();
         ev
     }
 
@@ -3003,6 +3025,33 @@ mod gpu_tests {
         let inked = want.chunks(4).filter(|p| p[..3] != BG[..3]).count();
         assert!(inked > 10_000, "the frame has ink ({inked} px)");
         assert!(worst <= 3, "GPU blend differs from the CPU composite by {worst}");
+    }
+
+    #[test]
+    fn requeued_cues_do_not_duplicate_events() {
+        // A sidecar's cues come again whenever the text pipeline restarts
+        // (every seek): the overlay must not hold an event twice — a
+        // duplicate collided with itself and climbed up the screen frame
+        // by frame.
+        let cues = ass_cues(
+            "Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,{\\fad(200,200)}Bottom line\n\
+             Dialogue: 0,0:00:00.00,0:00:05.00,Default,,0,0,0,,Second line\n",
+        );
+        let mut inner = super::tests::inner_with(Vec::new());
+        inner.add_cues(cues.clone());
+        inner.add_cues(cues.clone());
+        inner.add_cues(cues);
+        assert_eq!(inner.cues.len(), 2);
+        assert_eq!(inner.ass_active(1000), vec![0, 1]);
+        // and the renderer keeps a duplicated event where it was placed
+        let script = inner.ass.as_ref().unwrap().script.clone();
+        let mut r = ass::AssRenderer::new();
+        let frame = ass::frame_for(&script, 1280, 720, None, 1.0);
+        let top = |imgs: &[ass::Image]| imgs.iter().map(|i| i.dst_y).min().unwrap();
+        let first = top(&r.render(&script, &[0, 0, 1, 1], 300, frame));
+        for t in (342..2000).step_by(42) {
+            assert_eq!(top(&r.render(&script, &[0, 0, 1, 1], t, frame)), first, "moved at {t} ms");
+        }
     }
 
     #[test]

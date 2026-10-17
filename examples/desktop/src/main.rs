@@ -350,6 +350,7 @@ async fn run_console(player: Player) {
     println!("  v <i>    — pick video quality (HARD restart via seek)");
     println!("  s <i>    — pick video quality (SOFT switch — tests ABR supervisor swap)");
     println!("  a <i>    — pick audio track");
+    println!("  t <i>    — pick a manifest subtitle track; t off — subtitles off");
     println!("  abr on   — enable bandwidth-EWMA ABR (safety_factor=1.25)");
     println!("  abr off  — disable ABR (Manual)");
     println!("  p        — pause / resume (also: space in the window)");
@@ -397,6 +398,17 @@ async fn run_console(player: Player) {
             "s" => match arg.and_then(|s| s.parse::<usize>().ok()) {
                 Some(i) => pick_video_soft(&player, i),
                 None => println!("usage: s <index>"),
+            },
+            "t" => match arg {
+                Some("off") => {
+                    player.clear_subtitle_track();
+                    println!("subtitles off");
+                }
+                Some(a) => match a.parse::<usize>() {
+                    Ok(i) => pick_text(&player, i),
+                    Err(_) => println!("usage: t <index> | t off"),
+                },
+                None => println!("usage: t <index> | t off"),
             },
             "a" => match arg.and_then(|s| s.parse::<usize>().ok()) {
                 Some(i) => pick_audio(&player, i),
@@ -500,7 +512,33 @@ fn print_menu(player: &Player) {
             i += 1;
         }
     }
+    println!("Text:");
+    let current_text_id = player.current_subtitle_representation().map(|r| r.id);
+    let mut i = 0;
+    for adaptation in &tracks.text {
+        for repr in &adaptation.representations {
+            let marker = if Some(repr.id) == current_text_id { " *" } else { "" };
+            println!("  [{}] lang={}  {} {}{}", i, adaptation.lang, repr.codecs, repr.mime_type, marker);
+            i += 1;
+        }
+    }
     println!("========================");
+}
+
+fn pick_text(player: &Player, index: usize) {
+    let Ok(tracks) = player.get_tracks() else { return };
+    let mut i = 0;
+    for adaptation in &tracks.text {
+        for repr in &adaptation.representations {
+            if i == index {
+                println!("subtitles: [{}] lang={} {}", i, adaptation.lang, repr.codecs);
+                player.set_subtitle_track(repr);
+                return;
+            }
+            i += 1;
+        }
+    }
+    println!("invalid text index");
 }
 
 fn pick_video(player: &Player, index: usize) {
