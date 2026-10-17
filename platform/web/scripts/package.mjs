@@ -35,6 +35,11 @@ if (!existsSync(join(pkgDir, 'README.md')) && existsSync(join(crateDir, 'README.
   copyFileSync(join(crateDir, 'README.md'), join(pkgDir, 'README.md'));
 }
 
+// wasm-pack leaves `snippets/` (the crate's `inline_js` modules) out of
+// `files`, yet `rustplayer.js` imports from it, so a package without it does
+// not resolve in a bundler.
+const extraFiles = ['README.md', ...(existsSync(join(pkgDir, 'snippets')) ? ['snippets'] : [])];
+
 const out = {
   name: '@preclikos/rustplayer',
   version,
@@ -47,7 +52,7 @@ const out = {
   type: pkg.type ?? 'module',
   main: pkg.main,
   types: pkg.types,
-  files: [...new Set([...(pkg.files ?? []), 'README.md'])],
+  files: [...new Set([...(pkg.files ?? []), ...extraFiles])],
   sideEffects: pkg.sideEffects,
   keywords: ['dash', 'hevc', 'webcodecs', 'webgpu', 'player', 'wasm'],
 };

@@ -127,10 +127,11 @@ impl AssWorker {
 
 // --- page side -----------------------------------------------------------------
 
-#[wasm_bindgen(inline_js = "export function ass_glue_url() { return new URL('../../rustplayer.js', import.meta.url).href; }")]
+#[wasm_bindgen(inline_js = "export function ass_glue_url() { try { return new URL('../../rustplayer.js', import.meta.url).href; } catch { return ''; } }")]
 extern "C" {
     /// `rustplayer.js` next to this module's snippets (wasm-pack layout:
-    /// `snippets/<crate>/inline0.js`).
+    /// `snippets/<crate>/inline0.js`); empty when the module's own URL has
+    /// no such place (a `blob:` / `data:` module).
     fn ass_glue_url() -> String;
 }
 
@@ -189,6 +190,10 @@ impl WebAssOffload {
     /// came from). `None` back when the browser refuses a module worker.
     pub fn start(glue_url: Option<String>) -> Option<WebAssOffload> {
         let glue = glue_url.unwrap_or_else(ass_glue_url);
+        if glue.is_empty() {
+            log::warn!("[ass worker] no URL for rustplayer.js (set assWorkerModuleUrl); ASS renders on the page's thread");
+            return None;
+        }
         let src = format!("const GLUE_URL = {};\n{}", js_sys::JSON::stringify(&glue.into()).ok()?.as_string()?, WORKER_JS);
         let parts = js_sys::Array::of1(&src.into());
         let opts = web_sys::BlobPropertyBag::new();
