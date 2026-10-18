@@ -3,6 +3,19 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.26
+
+### All platforms
+
+- **The A/V drift gauge no longer creeps with every pause.** `Stats.av_drift_ms`
+  (and the HEALTH log line) measured the picture's wall clock against the
+  audio output across pauses and stalls, but the two stop and restart a few
+  tens of ms apart, and each hold left that difference in the gauge: on a
+  Google TV Streamer it read -115 ms after the first pause and -1420 ms
+  after 40. Lip-sync itself was unaffected (measured with the in-engine
+  probe: -13..-57 ms before and after pauses of 30 s to 10 min). The gauge
+  now starts a new baseline after every pause or stall.
+
 ## 0.2.25
 
 ### Android

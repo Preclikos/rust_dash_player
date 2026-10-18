@@ -189,6 +189,13 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     // read as a permanent ~-150..-220 ms "drift" on Android.
     const DRIFT_SETTLE: Duration = Duration::from_secs(2);
     let mut drift_settle_until: Option<Instant> = None;
+    // Set when the timeline was held (pause, starvation): the gauge's wall
+    // side drops the held span as measured by this loop, while the audio
+    // output stops and restarts at its own instants. The few tens of ms
+    // between them stayed in the gauge, one more per hold (BlackZone, -115
+    // to -870 ms over 15 pauses, lip-sync itself unchanged), so it starts
+    // over after every hold.
+    let mut drift_rebase = false;
     let mut last_drift_warn: Option<Instant> = None;
     // Min A/V drift over the current 1Hz stats window (least-stale read of
     // the chunky audio-played counter ≈ the true offset).
@@ -292,6 +299,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 _ = stop.notified() => break,
             }
             pause_skew += pause_started.elapsed();
+            drift_rebase = true;
             if stop_flag.load(Ordering::Relaxed) {
                 break;
             }
@@ -329,6 +337,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 if starvation_started.is_none() {
                     pause_skew += park_started.elapsed();
                 }
+                drift_rebase = true;
                 continue;
             }
             let starvation_wait = crate::rt::sleep(Duration::from_millis(300));
@@ -356,6 +365,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                         if let Some(t) = starvation_started.take() {
                             pause_skew += t.elapsed();
                         }
+                        drift_rebase = true;
                         starving = false;
                         if let StarvationTransition::ExitedBuffering =
                             report_starvation(&stats, StallSide::Video, false)
@@ -793,6 +803,12 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         let drift_at = render_start + ((shown_ns - clock_monotonic_ns()).max(0) / 1_000_000) as u64;
         #[cfg(not(target_os = "android"))]
         let drift_at = render_start;
+        if std::mem::take(&mut drift_rebase) {
+            log::debug!("[vsync] timeline held: re-baselining the A/V drift gauge");
+            drift_baseline = None;
+            drift_min_window = i64::MAX;
+            drift_settle_until = Some(Instant::now() + DRIFT_SETTLE);
+        }
         let epoch = audio_sink.clock_epoch();
         if epoch != drift_epoch {
             // The output's mapping to real time stepped on purpose (new
@@ -953,9 +969,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             // A/V drift = the MIN video-ahead offset over the window. The
             // 1Hz-sampled raw drift beats against the chunky audio-played
             // counter (a ±100ms sampling sawtooth); the per-window minimum
-            // is the least-stale read and tracks the true offset. Both
-            // clocks freeze together across pause/starvation, so this
-            // isolates genuine desync. Warn past 150ms.
+            // is the least-stale read and tracks the true offset. Holds
+            // (pause, starvation) start a new baseline (`drift_rebase`), so
+            // this isolates genuine desync. Warn past 150ms.
             let mut drift_out: Option<i64> = None;
             if drift_min_window != i64::MAX {
                 stats.av_drift_ms.store(drift_min_window, Ordering::Relaxed);
