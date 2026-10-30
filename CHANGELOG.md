@@ -3,6 +3,20 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.27
+
+### Android
+
+- **Video decoders are sized for the largest picture of the ladder.** The
+  player now sets `max-input-size` on every video decoder (ExoPlayer's HEVC
+  rule, at least 1 MiB). Before, the decoder chose its own input buffer
+  size, and a sample larger than that buffer was cut without a word: the
+  decoder then concealed the missing slices from older pictures, which
+  shows as horizontal bands of stale, differently bright image. Dolby
+  Vision decoders on TV SoCs are the ones most likely to choose a small
+  default. A sample that still does not fit is logged once per codec
+  (`[mc] input sample … truncated, picture corrupt`).
+
 ## 0.2.26
 
 ### All platforms

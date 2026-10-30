@@ -87,6 +87,8 @@ pub struct MediaCodecDecoder {
     /// VPS/SPS/PPS (Annex-B) of the representation switched to in place,
     /// sent in front of its first sample.
     pending_csd: Option<Vec<u8>>,
+    /// A sample has already been cut to the input buffer (warned once per codec).
+    truncation_warned: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -143,6 +145,31 @@ pub struct SharedDirectCodec {
 fn uptime_ms() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// `max-input-size` for a picture of `width`×`height`: ExoPlayer's HEVC rule
+/// (4:2:0 at a minimum compression ratio of 2), floored at 1 MiB. Without it
+/// the codec picks its own default, and the `video/dolby-vision` decoders on
+/// TV SoCs pick small ones: a big 4K I-frame then no longer fits, its tail
+/// slices are lost and the decoder conceals them from older pictures —
+/// horizontal bands of stale, differently bright image.
+fn max_input_size(width: u32, height: u32) -> i32 {
+    let pixels = width as usize * height as usize;
+    (pixels * 3 / 4).max(1 << 20).min(i32::MAX as usize) as i32
+}
+
+/// Warn (once per codec) when a sample is larger than the input buffer and
+/// has to be cut — the picture is then corrupted, never silently.
+fn warn_truncated(warned: &mut bool, sample: usize, cap: usize, pts_us: i64) {
+    if !*warned {
+        *warned = true;
+        log::warn!(
+            "[mc] input sample {} B > input buffer {} B at pts={}ms — truncated, picture corrupt",
+            sample,
+            cap,
+            pts_us / 1000
+        );
+    }
 }
 
 /// Frames the direct codecs reported rendered on the display
@@ -515,6 +542,7 @@ impl MediaCodecDecoder {
             max_size: (0, 0),
             dovi_profile: None,
             pending_csd: None,
+            truncation_warned: false,
         }
     }
 
@@ -757,6 +785,12 @@ impl MediaCodecDecoder {
                 ndk_sys::AMediaFormat_setInt32(format, c"max-width".as_ptr(), self.max_size.0 as i32);
                 ndk_sys::AMediaFormat_setInt32(format, c"max-height".as_ptr(), self.max_size.1 as i32);
             }
+            ndk_sys::AMediaFormat_setInt32(
+                format,
+                c"max-input-size".as_ptr(),
+                max_input_size(self.max_size.0, self.max_size.1),
+            );
+            self.truncation_warned = false;
             if mime == "video/dolby-vision" {
                 // MediaCodecInfo.CodecProfileLevel DolbyVisionProfile*
                 // constants — DV decoders key their mode off this.
@@ -973,6 +1007,9 @@ impl MediaCodecDecoder {
                 return Err("getInputBuffer(direct) returned null".into());
             }
             let len = annex_b.len().min(cap);
+            if len < annex_b.len() {
+                warn_truncated(&mut self.truncation_warned, annex_b.len(), cap, pts_us);
+            }
             std::ptr::copy_nonoverlapping(annex_b.as_ptr(), buf, len);
             let st = {
                 let _l = direct.call_lock.lock().unwrap();
@@ -1273,6 +1310,8 @@ impl HwVideoDecoder for MediaCodecDecoder {
         format.set_str("mime", mime);
         format.set_i32("width", params.width as i32);
         format.set_i32("height", params.height as i32);
+        format.set_i32("max-input-size", max_input_size(params.width, params.height));
+        self.truncation_warned = false;
         if !params.hvcc_nalus.is_empty() {
             // Build Annex-B csd-0: start-code prefix + raw NALU body for each NALU.
             let mut csd = Vec::new();
@@ -1417,6 +1456,9 @@ impl HwVideoDecoder for MediaCodecDecoder {
 
         let dst = input_buf.buffer_mut();
         let copy_len = annex_b.len().min(dst.len());
+        if copy_len < annex_b.len() {
+            warn_truncated(&mut self.truncation_warned, annex_b.len(), dst.len(), pts_us);
+        }
         unsafe {
             std::ptr::copy_nonoverlapping(
                 annex_b.as_ptr(),
