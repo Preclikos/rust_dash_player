@@ -491,9 +491,11 @@ impl AudioTrackSink {
         static LATENCY_FRAMES: AtomicI64 = AtomicI64::new(0);
         let rate = self.sample_rate as i64;
         let paused = self.paused.load(Ordering::Acquire);
+        let mut ts_age_ms = -1;
         let presented = match ts {
             Some((frame_pos, nano_time)) => {
                 let age_ns = clock_monotonic_ns() - nano_time;
+                ts_age_ms = age_ns / 1_000_000;
                 let fresh = !paused && (0..=TIMESTAMP_FRESH_NS).contains(&age_ns);
                 // A timestamp that has not moved since the last read and is
                 // past its freshness is a repeated snapshot of a stalled
@@ -501,18 +503,17 @@ impl AudioTrackSink {
                 // interpolation on top of it. ExoPlayer's AudioTimestampPoller
                 // draws the same line (TIMESTAMP_ADVANCING vs stale).
                 let advancing = frame_pos > self.last_ts_frame_pos.swap(frame_pos, Ordering::AcqRel);
+                let interp_ns = if paused || !(fresh || advancing) {
+                    0
+                } else {
+                    age_ns.clamp(0, TIMESTAMP_INTERP_MAX_NS)
+                };
                 if fresh {
                     let lat = consumed - frame_pos;
                     if lat >= 0 && lat < rate * 5 {
                         LATENCY_FRAMES.store(lat, Ordering::Relaxed);
                     }
                 }
-                let interp_ns = if paused || !(fresh || advancing) {
-                    0
-                } else {
-                    age_ns.clamp(0, TIMESTAMP_INTERP_MAX_NS)
-                };
-                let estimate = frame_pos + interp_ns * rate / 1_000_000_000;
                 // Nothing can be presented before it was consumed. Right after
                 // `play()` (a fresh track, a resume) the HAL hands out
                 // timestamps 300–350 ms AHEAD of the head (Streamer: presented
@@ -521,9 +522,18 @@ impl AudioTrackSink {
                 // them skipped the picture forward and then held it while the
                 // real position caught up. ExoPlayer's AudioTimestampPoller
                 // likewise refuses a timestamp until it has advanced
-                // consistently after start. The consumed head is the ceiling.
+                // consistently after start. The consumed head caps the
+                // timestamp's frame.
+                //
+                // The interpolation goes on top of the capped frame, not under
+                // the cap: the head is read at the same instant as the
+                // timestamp and moves in the same bursts (one E-AC-3 frame,
+                // 32 ms, on the Streamer), so capping the interpolated position
+                // cancelled it and held the clock on the last timestamp. The
+                // picture then ran up to one timestamp period behind the sound
+                // — further on outputs whose timestamps update rarely.
                 let ceiling = consumed - LATENCY_FRAMES.load(Ordering::Relaxed).max(0);
-                estimate.min(ceiling.max(0))
+                frame_pos.min(ceiling.max(0)) + interp_ns * rate / 1_000_000_000
             }
             None => {
                 let lat = LATENCY_FRAMES.load(Ordering::Relaxed);
@@ -541,8 +551,8 @@ impl AudioTrackSink {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) % 30 == 0 {
             log::debug!(
-                "[audio-pt] played_ms: have_ts={} presented={} consumed={} lat_cache={} paused={} -> {}ms",
-                ts.is_some(), presented, consumed,
+                "[audio-pt] played_ms: have_ts={} ts_age={}ms presented={} consumed={} lat_cache={} paused={} -> {}ms",
+                ts.is_some(), ts_age_ms, presented, consumed,
                 LATENCY_FRAMES.load(Ordering::Relaxed), paused, out
             );
         }

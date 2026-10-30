@@ -3,6 +3,19 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.28
+
+### Android
+
+- **The passthrough clock runs between audio timestamps.** With E-AC-3 /
+  AC-3 passthrough the clock stood on the last `AudioTimestamp` until the
+  next one arrived, so the picture ran up to one timestamp period behind
+  the sound (0–32 ms on a Google TV Streamer, more on outputs that update
+  their timestamps rarely, such as eARC to an AV receiver). The position
+  is now carried forward from the timestamp's instant, as ExoPlayer does;
+  the guard against the too-early timestamps right after `play()` stays.
+  The verbose `[audio-pt] played_ms` line reports the timestamp age.
+
 ## 0.2.27
 
 ### Android
