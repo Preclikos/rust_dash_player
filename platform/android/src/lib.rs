@@ -387,7 +387,26 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSt
         let _guard = runtime().enter();
         // The manifest GET runs while the renderers are being built.
         let prefetch = bridge::prefetch_manifest(&manifest, host.clone());
-        let mut player = Player::new_from_android_surface(native_window as *mut c_void, w, h);
+        let mut player = match Player::new_from_android_surface(native_window as *mut c_void, w, h) {
+            Ok(p) => p,
+            Err(detail) => {
+                // No player on this GPU (no OpenGL ES 3.0): tell the host
+                // through its normal onError path so it can show an
+                // "unsupported device" message, and hand back no handle.
+                log::error!("nativeStart: unsupported GPU: {}", detail);
+                host.on_event(bridge::fatal_error_json(
+                    player::PlayerErrorKind::UnsupportedGpu,
+                    &detail,
+                ));
+                unsafe {
+                    ndk_sys::ANativeWindow_release(native_window);
+                    if !video_window.is_null() {
+                        ndk_sys::ANativeWindow_release(video_window);
+                    }
+                }
+                return 0;
+            }
+        };
         player.adopt_manifest_prefetch(prefetch);
 
         if display_hdr_types != 0 {

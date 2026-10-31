@@ -851,6 +851,13 @@ fn obj(ty: &str) -> String {
     format!(r#"{{"type":{}}}"#, jstr(ty))
 }
 
+/// The host event for a fatal error raised before a player exists (e.g.
+/// [`player::PlayerErrorKind::UnsupportedGpu`] from the platform shell's
+/// constructor): the same `{"type":"error",...}` the running bridge emits.
+pub fn fatal_error_json(kind: player::PlayerErrorKind, detail: &str) -> String {
+    error_json(&error_kind(&kind), detail)
+}
+
 fn error_json(kind: &str, detail: &str) -> String {
     format!(
         r#"{{"type":"error","kind":{},"detail":{}}}"#,
@@ -885,6 +892,7 @@ fn error_kind(k: &player::PlayerErrorKind) -> String {
         player::PlayerErrorKind::ManifestParse => "manifest_parse".to_string(),
         player::PlayerErrorKind::Decoder => "decoder".to_string(),
         player::PlayerErrorKind::AudioOutput => "audio_output".to_string(),
+        player::PlayerErrorKind::UnsupportedGpu => "gpu_unsupported".to_string(),
         player::PlayerErrorKind::Other => "other".to_string(),
     }
 }

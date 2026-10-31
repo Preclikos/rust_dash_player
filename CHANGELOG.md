@@ -3,6 +3,24 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.29
+
+### Android
+
+- **Devices without OpenGL ES 3.0 report it instead of doing nothing.**
+  The renderer needs OpenGL ES 3.0; on GLES 2.0-only GPUs (Mali-450 in
+  older Amlogic TV boxes such as the Mi Box 4 on Android 9) no player could
+  be created and the host got no callback at all. `RustPlayer.start` now
+  reports `onError("gpu_unsupported", detail)` (new
+  `PlayerErrorKind::UnsupportedGpu`) and `isStarted` stays false. The error
+  is permanent for the device: show an "unsupported device" message or use
+  another player (see `docs/KNOWN_ISSUES.md`).
+
+### All platforms
+
+- `PlayerErrorKind` has a new variant, `UnsupportedGpu`; Rust hosts that
+  match it exhaustively need an arm for it.
+
 ## 0.2.28
 
 ### Android

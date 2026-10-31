@@ -20,6 +20,22 @@ These are not bugs in the player, but breaking them reproduces old bugs.
 | **Choose languages at start, not after.** Pass `preferredAudioLang` / `preferredSubtitleLang` to `start`. | Selecting audio after playback starts is a seek-rebuild; on a resume it can stall direct-mode decode. | `RustPlayer.start`, `StartConfig` |
 | **Provider hooks may block, but must return.** `onRequest`/`resolveKey` run on the blocking pool. | A hook that never returns stalls that request until the segment retry budget runs out. | `platform/android/src/lib.rs` |
 
+## GPUs without OpenGL ES 3.0 are not supported (Android)
+
+The Android renderer runs on wgpu's GL backend, which needs OpenGL ES 3.0.
+GLES 2.0-only GPUs (Mali-450 / Utgard, found in older Amlogic TV boxes such
+as the Mi Box 4 / Mi Box S on Android 9) expose no adapter, so no player is
+created: `RustPlayer.start` reports `onError("gpu_unsupported", detail)` and
+`isStarted` stays false. The host should show an "unsupported device"
+message or fall back to another player. Check a device with
+`adb shell dumpsys SurfaceFlinger | grep -i GLES`.
+
+Video and audio would not need the GPU in direct mode (MediaCodec renders to
+the video Surface); only the subtitle/overlay layer does, and its masks are
+rasterized on the CPU. A GPU-less overlay (CPU compositing into the overlay
+window with `ANativeWindow_lock`) would make these devices play, subtitles
+included; not implemented.
+
 ## Android request filter has no method or body
 
 - **What:** Android's `RustPlayerProvider.PreparedRequest` carries `url` and

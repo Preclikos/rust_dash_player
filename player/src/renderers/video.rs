@@ -540,6 +540,7 @@ impl VideoRenderer {
             },
         )
         .await
+        .expect("video renderer")
     }
 
     /// Embedded Apple path: build the wgpu surface from a host-provided
@@ -552,19 +553,25 @@ impl VideoRenderer {
         height: u32,
     ) -> Self {
         let size = PhysicalSize::new(width.max(1), height.max(1));
-        Self::new_with_surface(size, SurfaceSource::MetalLayer(layer)).await
+        Self::new_with_surface(size, SurfaceSource::MetalLayer(layer))
+            .await
+            .expect("video renderer")
     }
 
     /// Embedded Android path: build the wgpu surface from a host-provided
     /// `ANativeWindow*` (no winit `NativeActivity`). The host (JNI shim)
     /// acquires the window before this call and releases it after the renderer
     /// is dropped.
+    ///
+    /// Fails when the device's GPU cannot run the renderer: wgpu's GL backend
+    /// needs OpenGL ES 3.0, and GLES 2.0-only GPUs (Mali-450 / Utgard on older
+    /// Amlogic TV boxes such as the Mi Box 4) expose no adapter at all.
     #[cfg(target_os = "android")]
     pub async fn new_from_android_surface(
         native_window: *mut std::ffi::c_void,
         width: u32,
         height: u32,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let size = PhysicalSize::new(width.max(1), height.max(1));
         let window = RawWindowHandle::AndroidNdk(AndroidNdkWindowHandle::new(
             std::ptr::NonNull::new(native_window).expect("null ANativeWindow"),
@@ -577,14 +584,14 @@ impl VideoRenderer {
                 display: Some(display),
             },
         )
-        .await;
+        .await?;
         // Keep the raw window for ANativeWindow_setBuffersDataSpace (HDR
         // passthrough). The host owns the acquired reference and releases
         // it only after the renderer is dropped.
         renderer
             .android_window
             .store(native_window as usize, std::sync::atomic::Ordering::Release);
-        renderer
+        Ok(renderer)
     }
 
     /// Browser: build the wgpu surface on a host-provided `<canvas>`. WebGPU
@@ -594,13 +601,15 @@ impl VideoRenderer {
     #[cfg(target_arch = "wasm32")]
     pub async fn new_from_canvas(canvas: web_sys::HtmlCanvasElement, width: u32, height: u32) -> Self {
         let size = PhysicalSize::new(width.max(1), height.max(1));
-        Self::new_with_surface(size, SurfaceSource::Canvas(canvas)).await
+        Self::new_with_surface(size, SurfaceSource::Canvas(canvas))
+            .await
+            .expect("video renderer")
     }
 
     /// Shared constructor body. Differs from the old `new` only in how the
     /// wgpu surface is created and where the initial size comes from — both are
     /// parameters now.
-    async fn new_with_surface(size: PhysicalSize<u32>, surface_source: SurfaceSource) -> Self {
+    async fn new_with_surface(size: PhysicalSize<u32>, surface_source: SurfaceSource) -> Result<Self, String> {
         #[cfg(target_arch = "wasm32")]
         let backend = Backends::BROWSER_WEBGPU | Backends::GL;
         #[cfg(target_os = "windows")]
@@ -634,7 +643,7 @@ impl VideoRenderer {
                         raw_display_handle: display,
                         raw_window_handle: window,
                     })
-                    .unwrap()
+                    .map_err(|e| format!("wgpu surface: {e}"))?
             },
             #[cfg(any(target_os = "ios", target_os = "macos"))]
             SurfaceSource::MetalLayer(layer) => unsafe {
@@ -675,7 +684,7 @@ impl VideoRenderer {
                 ..Default::default()
             })
             .await
-            .unwrap();
+            .map_err(|e| format!("no OpenGL ES 3.0 GPU adapter (wgpu: {e})"))?;
 
         #[cfg(not(target_os = "android"))]
         let adapter = instance
@@ -685,7 +694,7 @@ impl VideoRenderer {
                 force_fallback_adapter: false,
             })
             .await
-            .unwrap();
+            .map_err(|e| format!("no GPU adapter (wgpu: {e})"))?;
 
         let backend = adapter.get_info().backend;
 
@@ -798,7 +807,7 @@ impl VideoRenderer {
                 trace: wgpu::Trace::Off,
             })
             .await
-            .unwrap();
+            .map_err(|e| format!("GPU device on {} (wgpu: {e})", adapter.get_info().name))?;
         // wgpu's default handler for an uncaptured error is panic!(), which
         // on Android aborts the whole app (SIGABRT) for what is often a
         // recoverable presentation hiccup — a rotation once killed a host app
@@ -1103,7 +1112,7 @@ impl VideoRenderer {
 
         renderer.spawn_command_thread(command_receiver);
 
-        renderer
+        Ok(renderer)
     }
 
     // ───────────────────────── offscreen (in-app) path ─────────────────────

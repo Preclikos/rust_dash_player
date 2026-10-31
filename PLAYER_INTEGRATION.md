@@ -642,6 +642,7 @@ Desktop test shell: drop a `.ass` (or a font file) on the window,
 | Multi-period MPD | rejected in `open_url` | `ManifestParse` |
 | Video pipeline death mid-play | internal retry from current position (3×, backoff, budget refills with progress) | `Buffering { Stall }` while retrying; `Error { Decoder }` + parked resume position when exhausted |
 | DV profile 5 without platform DV decoder | rejected at pipeline start | `Decoder` (Android: clear message) |
+| GPU without OpenGL ES 3.0 (Android: Mali-450 on older Amlogic boxes, e.g. Mi Box 4) | no player is created; `RustPlayer.start` leaves `isStarted == false` | `UnsupportedGpu` (`onError("gpu_unsupported", …)`); permanent for the device, do not retry |
 | Natural end | — | `EndOfStream` (guaranteed NOT emitted for error stops) |
 
 Known gap (tracked): the **audio** pipeline has no internal retry yet —

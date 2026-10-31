@@ -766,17 +766,20 @@ impl Player<VideoRenderer, AudioRenderer> {
     /// Embedded Android path: render into a host-provided `ANativeWindow*`
     /// (obtained from a Java `Surface`). Mirror of `new` for a host Activity
     /// that owns the `SurfaceView` (no winit `NativeActivity`).
+    ///
+    /// Fails with [`PlayerErrorKind::UnsupportedGpu`] when the GPU cannot run
+    /// the renderer (no OpenGL ES 3.0); `Err` carries the detail.
     #[cfg(target_os = "android")]
     pub fn new_from_android_surface(
         native_window: *mut std::ffi::c_void,
         width: u32,
         height: u32,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let video_renderer = Arc::new(
-            VideoRenderer::new_from_android_surface(native_window, width, height).block_on(),
+            VideoRenderer::new_from_android_surface(native_window, width, height).block_on()?,
         );
         let audio_renderer = Arc::new(AudioRenderer::new());
-        Self::from_renderers(video_renderer, audio_renderer)
+        Ok(Self::from_renderers(video_renderer, audio_renderer))
     }
 
     /// Browser: render into a host-provided `<canvas>` (WebGPU, WebGL2

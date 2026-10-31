@@ -49,6 +49,18 @@ class RustPlayer(private val context: Context) {
         fun onPosition(positionMs: Long, durationMs: Long) {}
         fun onVideoSize(width: Int, height: Int) {}
         fun onEnded() {}
+        /**
+         * Fatal: playback cannot continue. [kind] is stable for branching
+         * (`network`, `http_<status>`, `interceptor`, `license_resolver`,
+         * `manifest_parse`, `decoder`, `audio_output`, `gpu_unsupported`,
+         * `other`); [detail] is for logs, not for the viewer.
+         *
+         * `gpu_unsupported` arrives right after [start] when the device's GPU
+         * cannot run the player (no OpenGL ES 3.0, e.g. Mali-450 on older
+         * Amlogic boxes such as the Mi Box 4). No player was created
+         * ([isStarted] stays false) and retrying cannot help: show an
+         * "unsupported device" message or hand the item to another player.
+         */
         fun onError(kind: String, detail: String) {}
 
         /**
@@ -154,6 +166,8 @@ class RustPlayer(private val context: Context) {
             preferredAudioLang,
             preferredSubtitleLang,
         )
+        // 0 = no player (onError already queued, e.g. gpu_unsupported).
+        if (handle == 0L) return
         if (reportDisplayTiming) {
             trackDisplayTiming()
             if (alignToVsync) startVsyncSampling()

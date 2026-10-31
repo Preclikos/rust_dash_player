@@ -145,6 +145,12 @@ pub enum PlayerErrorKind {
     /// standby and never came back. Playback is not silently continued: a
     /// movie without sound is a failure, not a degraded success.
     AudioOutput,
+    /// The device's GPU cannot run the player's renderer, so no player was
+    /// created. Android: wgpu's GL backend needs OpenGL ES 3.0; GLES
+    /// 2.0-only GPUs (Mali-450 on older Amlogic TV boxes such as the Mi
+    /// Box 4) have no usable adapter. Permanent for the device: show an
+    /// "unsupported device" message instead of retrying.
+    UnsupportedGpu,
     Other,
 }
 
