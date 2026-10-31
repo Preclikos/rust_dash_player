@@ -472,7 +472,15 @@ struct SubtitleHold {
     selection: AtomicU64,
 }
 
-pub struct Player<V: VideoSink = VideoRenderer, A: AudioSink = AudioRenderer> {
+/// The video sink a plain `Player` renders through: the wgpu renderer, and
+/// on Android the [`AndroidVideo`](crate::renderers::android_video::AndroidVideo)
+/// wrapper that falls back to a GPU-less overlay.
+#[cfg(target_os = "android")]
+pub type DefaultVideoSink = crate::renderers::android_video::AndroidVideo;
+#[cfg(not(target_os = "android"))]
+pub type DefaultVideoSink = VideoRenderer;
+
+pub struct Player<V: VideoSink = DefaultVideoSink, A: AudioSink = AudioRenderer> {
     base_url: Option<String>,
     manifest: Option<Manifest>,
     tracks: Arc<StdMutex<Option<Tracks>>>,
@@ -763,25 +771,6 @@ impl Player<VideoRenderer, AudioRenderer> {
         Self::from_renderers(video_renderer, audio_renderer)
     }
 
-    /// Embedded Android path: render into a host-provided `ANativeWindow*`
-    /// (obtained from a Java `Surface`). Mirror of `new` for a host Activity
-    /// that owns the `SurfaceView` (no winit `NativeActivity`).
-    ///
-    /// Fails with [`PlayerErrorKind::UnsupportedGpu`] when the GPU cannot run
-    /// the renderer (no OpenGL ES 3.0); `Err` carries the detail.
-    #[cfg(target_os = "android")]
-    pub fn new_from_android_surface(
-        native_window: *mut std::ffi::c_void,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, String> {
-        let video_renderer = Arc::new(
-            VideoRenderer::new_from_android_surface(native_window, width, height).block_on()?,
-        );
-        let audio_renderer = Arc::new(AudioRenderer::new());
-        Ok(Self::from_renderers(video_renderer, audio_renderer))
-    }
-
     /// Browser: render into a host-provided `<canvas>` (WebGPU, WebGL2
     /// fallback) and play audio through Web Audio. Async because a WebGPU
     /// adapter/device can only be obtained asynchronously — there is no
@@ -821,6 +810,43 @@ impl Player<VideoRenderer, AudioRenderer> {
     ) -> Self {
         Self::with_sinks(video_renderer, audio_renderer)
     }
+}
+
+#[cfg(target_os = "android")]
+impl Player<crate::renderers::android_video::AndroidVideo, AudioRenderer> {
+    /// Embedded Android path: render into a host-provided `ANativeWindow*`
+    /// (obtained from a Java `Surface`). Mirror of `new` for a host Activity
+    /// that owns the `SurfaceView` (no winit `NativeActivity`).
+    ///
+    /// Fails with [`PlayerErrorKind::UnsupportedGpu`] when the GPU cannot run
+    /// the renderer (no OpenGL ES 3.0); `Err` carries the detail.
+    #[cfg(target_os = "android")]
+    pub fn new_from_android_surface(
+        native_window: *mut std::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let renderer = VideoRenderer::new_from_android_surface(native_window, width, height).block_on()?;
+        Ok(Self::with_sinks(
+            Arc::new(crate::renderers::android_video::AndroidVideo::Gpu(renderer)),
+            Arc::new(AudioRenderer::new()),
+        ))
+    }
+
+    /// The fallback for a GPU [`Self::new_from_android_surface`] refused:
+    /// video only in direct mode (the host must hand a video Surface to
+    /// [`Self::set_video_output_window`] before playback), subtitles written
+    /// into the overlay window `native_window` by the CPU. No GLES path, no
+    /// in-player tonemap.
+    pub fn new_from_android_surface_without_gpu(native_window: *mut std::ffi::c_void) -> Self {
+        Self::with_sinks(
+            Arc::new(crate::renderers::android_video::AndroidVideo::Cpu(
+                crate::renderers::android_video::CpuOverlay::new(native_window as usize),
+            )),
+            Arc::new(AudioRenderer::new()),
+        )
+    }
+
 }
 
 impl<V: VideoSink, A: AudioSink> Player<V, A> {

@@ -389,11 +389,19 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSt
         let prefetch = bridge::prefetch_manifest(&manifest, host.clone());
         let mut player = match Player::new_from_android_surface(native_window as *mut c_void, w, h) {
             Ok(p) => p,
+            // No GPU renderer (no OpenGL ES 3.0): with a video Surface the
+            // picture needs no GPU (direct mode) and the subtitles go into
+            // the overlay from the CPU.
+            Err(detail) if !video_window.is_null() => {
+                log::warn!("nativeStart: no GPU renderer ({}); playing without a GPU", detail);
+                Player::new_from_android_surface_without_gpu(native_window as *mut c_void)
+            }
             Err(detail) => {
-                // No player on this GPU (no OpenGL ES 3.0): tell the host
-                // through its normal onError path so it can show an
-                // "unsupported device" message, and hand back no handle.
-                log::error!("nativeStart: unsupported GPU: {}", detail);
+                // Without a video Surface the picture itself would need the
+                // GPU: tell the host through its normal onError path so it
+                // can show an "unsupported device" message, and hand back no
+                // handle.
+                log::error!("nativeStart: unsupported GPU and no video Surface: {}", detail);
                 host.on_event(bridge::fatal_error_json(
                     player::PlayerErrorKind::UnsupportedGpu,
                     &detail,

@@ -485,7 +485,10 @@ struct Offload {
 }
 
 #[cfg_attr(target_os = "android", allow(dead_code))]
-pub struct SubtitleOverlay {
+/// The wgpu half of [`SubtitleOverlay`]: pipelines, buffers and the cue
+/// texture. Absent on a GPU-less overlay ([`SubtitleOverlay::new_cpu`]),
+/// whose host takes the bitmaps from [`SubtitleOverlay::active_bitmap`].
+struct OverlayGpu {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface_format: wgpu::TextureFormat,
@@ -493,14 +496,10 @@ pub struct SubtitleOverlay {
     /// `fs_main_pq` into an rgba16float target, built on the first frame of
     /// an HDR output session (see [`Self::set_pq_output`]).
     pipeline_pq: std::sync::OnceLock<wgpu::RenderPipeline>,
-    /// Draw through `pipeline_pq` — the video renderer flips it on HDR
-    /// output session entry/exit.
-    pq_output: std::sync::atomic::AtomicBool,
     /// `fs_main` into a [`DIRECT_OVERLAY_FORMAT`] target — the Apple direct
     /// mode keeps the render layer in that 8-bit-alpha format while it is a
     /// transparent subtitle overlay (see [`Self::set_direct_output`]).
     pipeline_direct: std::sync::OnceLock<wgpu::RenderPipeline>,
-    direct_output: std::sync::atomic::AtomicBool,
     shader: wgpu::ShaderModule,
     pipeline_layout: wgpu::PipelineLayout,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -512,15 +511,25 @@ pub struct SubtitleOverlay {
     mask_pipelines: [std::sync::OnceLock<wgpu::RenderPipeline>; 3],
     mask_uniform: wgpu::Buffer,
     gpu_masks: Mutex<Option<GpuMasks>>,
+    /// Render-thread-owned GPU mirror. Never touched by the worker.
+    gpu: Mutex<Option<GpuCue>>,
+}
+
+pub struct SubtitleOverlay {
+    /// Draw through `pipeline_pq` — the video renderer flips it on HDR
+    /// output session entry/exit.
+    pq_output: std::sync::atomic::AtomicBool,
+    direct_output: std::sync::atomic::AtomicBool,
     /// See [`AssOffload`]; `None` = render here.
     offload: Arc<Mutex<Option<Offload>>>,
     /// Fonts added for ASS, replayed to an offload installed later.
     ass_fonts: Mutex<Vec<Arc<[u8]>>>,
 
+    /// `None` on a GPU-less overlay: cues are rasterized and looked up, never
+    /// drawn here.
+    gpu_res: Option<OverlayGpu>,
     /// Cue state + rasterizer output, shared with the worker thread.
     shared: Arc<Shared>,
-    /// Render-thread-owned GPU mirror. Never touched by the worker.
-    gpu: Mutex<Option<GpuCue>>,
     /// Joined in `Drop`. `None` only if the thread failed to spawn, in
     /// which case cues simply never rasterize (rendering degrades to no
     /// subtitles rather than stalling the frame).
@@ -634,6 +643,8 @@ struct Inner {
     /// Decoded video size (libass storage size); 0×0 = unknown.
     video_w: u32,
     video_h: u32,
+    /// No GPU to blend ASS masks: the worker composites ASS frames to RGBA.
+    cpu_composite: bool,
 }
 
 impl Inner {
@@ -1238,6 +1249,41 @@ impl SubtitleOverlay {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
+        let mask_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("subtitle_mask_uniform"),
+            size: std::mem::size_of::<QuadUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self::build(Some(OverlayGpu {
+            device,
+            queue,
+            surface_format,
+            pipeline,
+            pipeline_pq: std::sync::OnceLock::new(),
+            pipeline_direct: std::sync::OnceLock::new(),
+            shader,
+            pipeline_layout,
+            bind_group_layout,
+            sampler,
+            uniform_buffer,
+            mask_pipelines: Default::default(),
+            mask_uniform,
+            gpu_masks: Mutex::new(None),
+            gpu: Mutex::new(None),
+        }))
+    }
+
+    /// An overlay without a GPU: cues are queued, rasterized by the worker
+    /// and handed out by [`Self::active_bitmap`] for the host to composite
+    /// (Android devices without OpenGL ES 3.0). `draw_into` draws nothing.
+    #[cfg_attr(not(target_os = "android"), allow(dead_code))]
+    pub fn new_cpu() -> Self {
+        Self::build(None)
+    }
+
+    fn build(gpu_res: Option<OverlayGpu>) -> Self {
         let shared = Arc::new(Shared {
             inner: Mutex::new(Inner {
                 cues: Vec::new(),
@@ -1266,15 +1312,9 @@ impl SubtitleOverlay {
                 ass_relayout: false,
                 video_w: 0,
                 video_h: 0,
+                cpu_composite: gpu_res.is_none(),
             }),
             wake: std::sync::Condvar::new(),
-        });
-
-        let mask_uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("subtitle_mask_uniform"),
-            size: std::mem::size_of::<QuadUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
         });
 
         let worker = {
@@ -1296,27 +1336,13 @@ impl SubtitleOverlay {
         };
 
         SubtitleOverlay {
-            device,
-            queue,
-            surface_format,
-            pipeline,
-            pipeline_pq: std::sync::OnceLock::new(),
             pq_output: std::sync::atomic::AtomicBool::new(false),
-            pipeline_direct: std::sync::OnceLock::new(),
             direct_output: std::sync::atomic::AtomicBool::new(false),
             texture_allocs: std::sync::atomic::AtomicU64::new(0),
-            shader,
-            pipeline_layout,
-            bind_group_layout,
-            sampler,
-            uniform_buffer,
-            mask_pipelines: Default::default(),
-            mask_uniform,
-            gpu_masks: Mutex::new(None),
             offload: Arc::new(Mutex::new(None)),
             ass_fonts: Mutex::new(Vec::new()),
+            gpu_res,
             shared,
-            gpu: Mutex::new(None),
             worker,
         }
     }
@@ -1501,6 +1527,7 @@ impl SubtitleOverlay {
     /// draws nothing this frame.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     pub fn draw_into(&self, render_pass: &mut wgpu::RenderPass<'_>, parent: &CueParent) {
+        let Some(gr) = self.gpu_res.as_ref() else { return };
         if parent.target_w == 0 || parent.target_h == 0 {
             return;
         }
@@ -1539,7 +1566,7 @@ impl SubtitleOverlay {
             return;
         }
 
-        let mut gpu = self.gpu.lock().unwrap();
+        let mut gpu = gr.gpu.lock().unwrap();
         // Upload only when the content changed, into the one reused texture
         // (grown first when this cue doesn't fit, guard texels included).
         let stale = match gpu.as_ref() {
@@ -1552,7 +1579,7 @@ impl SubtitleOverlay {
                 .is_some_and(|g| g.cap_w > bitmap.width && g.cap_h > bitmap.height);
             if !fits {
                 let (old_w, old_h) = gpu.as_ref().map_or((0, 0), |g| (g.cap_w, g.cap_h));
-                let max = self.device.limits().max_texture_dimension_2d;
+                let max = gr.device.limits().max_texture_dimension_2d;
                 let cap_w = (bitmap.width + 1).max(old_w).next_multiple_of(256).min(max);
                 let cap_h = (bitmap.height + 1).max(old_h).next_multiple_of(64).min(max);
                 *gpu = Some(self.create_gpu_cue(cap_w, cap_h));
@@ -1571,8 +1598,8 @@ impl SubtitleOverlay {
             uv_scale[0], uv_scale[1], uv_scale[2], uv_scale[3],
         ];
         if g.uniform != uniform {
-            self.queue.write_buffer(
-                &self.uniform_buffer,
+            gr.queue.write_buffer(
+                &gr.uniform_buffer,
                 0,
                 bytemuck::cast_slice(&[QuadUniform { transform, uv_scale }]),
             );
@@ -1580,47 +1607,48 @@ impl SubtitleOverlay {
         }
 
         let pipeline = if self.direct_output.load(std::sync::atomic::Ordering::Relaxed) {
-            self.pipeline_direct.get_or_init(|| {
+            gr.pipeline_direct.get_or_init(|| {
                 build_pipeline(
-                    &self.device,
-                    &self.shader,
-                    &self.pipeline_layout,
+                    &gr.device,
+                    &gr.shader,
+                    &gr.pipeline_layout,
                     DIRECT_OVERLAY_FORMAT,
                     "fs_main",
                 )
             })
         } else if self.pq_output.load(std::sync::atomic::Ordering::Relaxed) {
-            self.pipeline_pq.get_or_init(|| {
+            gr.pipeline_pq.get_or_init(|| {
                 build_pipeline(
-                    &self.device,
-                    &self.shader,
-                    &self.pipeline_layout,
+                    &gr.device,
+                    &gr.shader,
+                    &gr.pipeline_layout,
                     wgpu::TextureFormat::Rgba16Float,
                     "fs_main_pq",
                 )
             })
         } else {
-            &self.pipeline
+            &gr.pipeline
         };
         render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &g.bind_group, &[]);
         render_pass.draw(0..6, 0..1);
         // suppress unused-warning on surface_format
-        let _ = self.surface_format;
+        let _ = gr.surface_format;
     }
 
     /// An ASS frame as masks: the atlas into the (grow-only) R8 texture and
     /// the vertices into the (grow-only) vertex buffer when the frame
     /// changed, then one draw blends every image in paint order.
     fn draw_masks(&self, render_pass: &mut wgpu::RenderPass<'_>, generation: u64, masks: &ass::Layers, transform: [f32; 4]) {
-        let mut gpu = self.gpu_masks.lock().unwrap();
+        let gr = self.gpu_res.as_ref().expect("GPU subtitle overlay");
+        let mut gpu = gr.gpu_masks.lock().unwrap();
         let vbytes = (masks.vertices.len() * 4) as u64;
         let stale = gpu.as_ref().is_none_or(|g| g.generation != generation);
         if stale {
             let fits = gpu.as_ref().is_some_and(|g| g.cap_w >= masks.atlas_w && g.cap_h >= masks.atlas_h && g.vcap >= vbytes + 64);
             if !fits {
                 let (ow, oh, ov) = gpu.as_ref().map_or((0, 0, 0), |g| (g.cap_w, g.cap_h, g.vcap));
-                let max = self.device.limits().max_texture_dimension_2d;
+                let max = gr.device.limits().max_texture_dimension_2d;
                 let cap_w = masks.atlas_w.max(ow).next_multiple_of(256).min(max);
                 let cap_h = masks.atlas_h.max(oh).next_multiple_of(64).min(max);
                 // room past the last vertex (see MASK_VERTEX_PAD in the
@@ -1629,13 +1657,13 @@ impl SubtitleOverlay {
                 *gpu = Some(self.create_gpu_masks(cap_w, cap_h, vcap));
             }
             let g = gpu.as_mut().expect("just created");
-            self.queue.write_texture(
+            gr.queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture: &g.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 &masks.atlas,
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(masks.atlas_w), rows_per_image: Some(masks.atlas_h) },
                 wgpu::Extent3d { width: masks.atlas_w, height: masks.atlas_h, depth_or_array_layers: 1 },
             );
-            self.queue.write_buffer(&g.vertices, 0, bytemuck::cast_slice(&masks.vertices));
+            gr.queue.write_buffer(&g.vertices, 0, bytemuck::cast_slice(&masks.vertices));
             g.generation = generation;
             g.vertex_count = (masks.vertices.len() / ass::LAYER_VERTEX_FLOATS) as u32;
             g.uv_scale = [masks.atlas_w as f32 / g.cap_w as f32, masks.atlas_h as f32 / g.cap_h as f32];
@@ -1644,7 +1672,7 @@ impl SubtitleOverlay {
         let uniform = [transform[0], transform[1], transform[2], transform[3], g.uv_scale[0], g.uv_scale[1], 0.0, 0.0];
         if g.uniform != uniform {
             let uv_scale = [g.uv_scale[0], g.uv_scale[1], 0.0, 0.0];
-            self.queue.write_buffer(&self.mask_uniform, 0, bytemuck::cast_slice(&[QuadUniform { transform, uv_scale }]));
+            gr.queue.write_buffer(&gr.mask_uniform, 0, bytemuck::cast_slice(&[QuadUniform { transform, uv_scale }]));
             g.uniform = uniform;
         }
         let (slot, format, fs) = if self.direct_output.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1652,9 +1680,9 @@ impl SubtitleOverlay {
         } else if self.pq_output.load(std::sync::atomic::Ordering::Relaxed) {
             (1, wgpu::TextureFormat::Rgba16Float, "fs_mask_pq")
         } else {
-            (0, self.surface_format, "fs_mask")
+            (0, gr.surface_format, "fs_mask")
         };
-        let pipeline = self.mask_pipelines[slot].get_or_init(|| build_mask_pipeline(&self.device, &self.shader, &self.pipeline_layout, format, fs));
+        let pipeline = gr.mask_pipelines[slot].get_or_init(|| build_mask_pipeline(&gr.device, &gr.shader, &gr.pipeline_layout, format, fs));
         render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &g.bind_group, &[]);
         render_pass.set_vertex_buffer(0, g.vertices.slice(..));
@@ -1662,8 +1690,9 @@ impl SubtitleOverlay {
     }
 
     fn create_gpu_masks(&self, cap_w: u32, cap_h: u32, vcap: u64) -> GpuMasks {
+        let gr = self.gpu_res.as_ref().expect("GPU subtitle overlay");
         self.texture_allocs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        let texture = gr.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("subtitle_mask_atlas"),
             size: wgpu::Extent3d { width: cap_w, height: cap_h, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -1674,16 +1703,16 @@ impl SubtitleOverlay {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = gr.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("subtitle_mask_bind_group"),
-            layout: &self.bind_group_layout,
+            layout: &gr.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: self.mask_uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&gr.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: gr.mask_uniform.as_entire_binding() },
             ],
         });
-        let vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let vertices = gr.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("subtitle_mask_vertices"),
             size: vcap,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
@@ -1724,8 +1753,9 @@ impl SubtitleOverlay {
     /// does not fit the current one.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     fn create_gpu_cue(&self, cap_w: u32, cap_h: u32) -> GpuCue {
+        let gr = self.gpu_res.as_ref().expect("GPU subtitle overlay");
         self.texture_allocs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+        let texture = gr.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("subtitle_cue_texture"),
             size: wgpu::Extent3d {
                 width: cap_w,
@@ -1740,9 +1770,9 @@ impl SubtitleOverlay {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = gr.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("subtitle_bind_group"),
-            layout: &self.bind_group_layout,
+            layout: &gr.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1750,11 +1780,11 @@ impl SubtitleOverlay {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Sampler(&gr.sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: self.uniform_buffer.as_entire_binding(),
+                    resource: gr.uniform_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1779,8 +1809,9 @@ impl SubtitleOverlay {
     /// hold an older, larger cue that would otherwise bleed in.
     #[cfg_attr(target_os = "android", allow(dead_code))]
     fn upload_cue(&self, g: &GpuCue, bitmap: &SubtitleBitmap) {
+        let gr = self.gpu_res.as_ref().expect("GPU subtitle overlay");
         let write = |x: u32, y: u32, w: u32, h: u32, data: &[u8]| {
-            self.queue.write_texture(
+            gr.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &g.texture,
                     mip_level: 0,
@@ -1884,6 +1915,7 @@ impl SubtitleOverlay {
                 relayout: a.relayout,
                 scale: a.scale,
                 brief: a.brief,
+                rgba: a.rgba,
             }),
         };
         let (shared, offload) = (Arc::clone(&self.shared), Arc::clone(&self.offload));
@@ -2044,6 +2076,9 @@ struct AssJob {
     /// Replaced soon (animation, frame-by-frame signs): the frames the
     /// render scale adapts to.
     brief: bool,
+    /// Blend into one RGBA frame here instead of leaving masks for a GPU
+    /// (a GPU-less overlay).
+    rgba: bool,
 }
 
 /// A job's output.
@@ -2084,7 +2119,8 @@ fn bake(job: &RasterJob) -> Baked {
             let started = crate::rt::Instant::now();
             let imgs = r.render(&a.script, &a.show.key.events, a.show.time_ms, a.frame);
             let rendered = crate::rt::Instant::now();
-            let out = match ass::layers(&imgs, a.frame.width, a.frame.height) {
+            let masks = if a.rgba { None } else { ass::layers(&imgs, a.frame.width, a.frame.height) };
+            let out = match masks {
                 Some(l) => AssFrame::Masks(l),
                 None => ass::composite(&imgs, a.frame.width, a.frame.height).map_or(AssFrame::Empty, AssFrame::Rgba),
             };
@@ -2161,6 +2197,7 @@ fn next_job(inner: &Inner) -> Option<RasterJob> {
                         relayout: inner.ass_relayout,
                         scale,
                         brief,
+                        rgba: inner.cpu_composite,
                     }),
                 });
             }
@@ -2301,6 +2338,7 @@ mod tests {
             ass_relayout: false,
             video_w: 0,
             video_h: 0,
+            cpu_composite: false,
         }
     }
 

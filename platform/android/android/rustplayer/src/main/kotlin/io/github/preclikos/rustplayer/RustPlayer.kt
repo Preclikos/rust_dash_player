@@ -57,9 +57,11 @@ class RustPlayer(private val context: Context) {
          *
          * `gpu_unsupported` arrives right after [start] when the device's GPU
          * cannot run the player (no OpenGL ES 3.0, e.g. Mali-450 on older
-         * Amlogic boxes such as the Mi Box 4). No player was created
-         * ([isStarted] stays false) and retrying cannot help: show an
-         * "unsupported device" message or hand the item to another player.
+         * Amlogic boxes such as the Mi Box 4) AND [start] got no video
+         * Surface; with one, such a device plays without a GPU. No player
+         * was created ([isStarted] stays false) and retrying cannot help:
+         * show an "unsupported device" message or hand the item to another
+         * player.
          */
         fun onError(kind: String, detail: String) {}
 

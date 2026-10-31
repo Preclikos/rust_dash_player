@@ -3,6 +3,19 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.30
+
+### Android
+
+- **Devices without OpenGL ES 3.0 play.** When the GPU renderer cannot
+  start (GLES 2.0-only GPUs such as Mali-450 in the Mi Box 4) and the host
+  passes a video Surface, the player now runs without a GPU: MediaCodec
+  renders the picture into the video Surface as in normal direct mode, and
+  subtitles (SRT, VTT and ASS) are composited by the CPU into the overlay
+  window, with the same placement and look as on the GPU path.
+  `onError("gpu_unsupported", …)` is now reported only when `start` got no
+  video Surface. See `docs/KNOWN_ISSUES.md` for the limits of this mode.
+
 ## 0.2.29
 
 ### Android

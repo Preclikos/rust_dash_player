@@ -20,21 +20,28 @@ These are not bugs in the player, but breaking them reproduces old bugs.
 | **Choose languages at start, not after.** Pass `preferredAudioLang` / `preferredSubtitleLang` to `start`. | Selecting audio after playback starts is a seek-rebuild; on a resume it can stall direct-mode decode. | `RustPlayer.start`, `StartConfig` |
 | **Provider hooks may block, but must return.** `onRequest`/`resolveKey` run on the blocking pool. | A hook that never returns stalls that request until the segment retry budget runs out. | `platform/android/src/lib.rs` |
 
-## GPUs without OpenGL ES 3.0 are not supported (Android)
+## GPUs without OpenGL ES 3.0 play without a GPU (Android)
 
 The Android renderer runs on wgpu's GL backend, which needs OpenGL ES 3.0.
 GLES 2.0-only GPUs (Mali-450 / Utgard, found in older Amlogic TV boxes such
-as the Mi Box 4 / Mi Box S on Android 9) expose no adapter, so no player is
-created: `RustPlayer.start` reports `onError("gpu_unsupported", detail)` and
-`isStarted` stays false. The host should show an "unsupported device"
-message or fall back to another player. Check a device with
-`adb shell dumpsys SurfaceFlinger | grep -i GLES`.
+as the Mi Box 4 / Mi Box S on Android 9) expose no adapter. Check a device
+with `adb shell dumpsys SurfaceFlinger | grep -i GLES`.
 
-Video and audio would not need the GPU in direct mode (MediaCodec renders to
-the video Surface); only the subtitle/overlay layer does, and its masks are
-rasterized on the CPU. A GPU-less overlay (CPU compositing into the overlay
-window with `ANativeWindow_lock`) would make these devices play, subtitles
-included; not implemented.
+- **With a video Surface** (`RustPlayer.start(..., video = surface, ...)`,
+  the production direct mode) the player runs without a GPU: MediaCodec
+  renders the picture into the video Surface, and subtitles (SRT, VTT and
+  ASS) are composited by the CPU into the overlay window. Logged as
+  `no GPU renderer ...; playing without a GPU`.
+- **Without a video Surface** the picture itself would need the GPU:
+  `start` reports `onError("gpu_unsupported", detail)` and `isStarted`
+  stays false. Show an "unsupported device" message or use another player.
+
+Limits of the GPU-less mode: no GLES picture path (detaching the video
+Surface leaves the picture black until it is back), no in-player tonemap
+(direct mode hands HDR to the display anyway), and animated ASS (karaoke,
+moves) is composited on the CPU every frame, which has not been measured on
+a GLES 2.0 box. The mode was verified on a Google TV Streamer with the GPU
+renderer forced off, not on a Mali-450 device.
 
 ## Android request filter has no method or body
 

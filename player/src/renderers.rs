@@ -1,3 +1,6 @@
+// Android: the wgpu renderer or, without OpenGL ES 3.0, a GPU-less overlay.
+#[cfg(target_os = "android")]
+pub mod android_video;
 pub mod audio;
 pub mod subtitle;
 pub mod video;
