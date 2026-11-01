@@ -143,9 +143,17 @@ mod native {
         }
         let total: usize = verdicts.iter().map(|v| v.len()).sum();
         let unsupported = verdicts.iter().flatten().filter(|v| **v == Some(false)).count();
+        let unknown = verdicts.iter().flatten().filter(|v| v.is_none()).count();
         let ms = t0.elapsed().as_millis();
         if unsupported == 0 {
-            log::info!("[support] all {total} video representation(s) decodable here ({} probe, {ms} ms)", probe.name());
+            if unknown == 0 {
+                log::info!("[support] all {total} video representation(s) decodable here ({} probe, {ms} ms)", probe.name());
+            } else {
+                log::info!(
+                    "[support] {unknown} of {total} video representation(s) could not be checked ({} probe), all kept",
+                    probe.name()
+                );
+            }
             return;
         }
         if unsupported == total {
