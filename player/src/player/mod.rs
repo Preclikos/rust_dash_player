@@ -2745,7 +2745,6 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                 // if a superseded generation keeps running (orphaned pipeline).
                 static PIPELINE_GEN: AtomicU64 = AtomicU64::new(0);
                 let gen = PIPELINE_GEN.fetch_add(1, Ordering::Relaxed);
-                let fatal: supervisor::FatalSlot = Arc::new(StdMutex::new(None));
                 let video = crate::rt::spawn(video_supervisor(
                     gen,
                     video_representation,
@@ -2767,7 +2766,6 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
                     Arc::clone(&hdr_decode_8bit),
                     ladder_max,
                     Arc::clone(&pending_resume),
-                    Arc::clone(&fatal),
                 ));
 
                 let sample_rate = audio_sink.sample_rate();
@@ -2933,24 +2931,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
 
                 // Restart in-process iff a seek arrived (seek_target set again
                 // by seek()/change_*_track). A real stop()/EOS leaves it None.
-                let restarting = seek_target.read().await.is_some();
-                // A failure is fatal only if playback ends here. When a seek or
-                // track switch came in meanwhile, the next generation starts
-                // from its position and plays on: log the failure, drop the
-                // resume position it parked, and keep it from the host.
-                if let Some((kind, detail)) = fatal.lock().unwrap().take() {
-                    if restarting {
-                        log::warn!(
-                            "[player] pipeline gen {} failed ({:?}: {}); a seek / track switch restarts it, not reported",
-                            gen, kind, detail
-                        );
-                        stats.debug.log("pipeline", format!("failure superseded by a restart: {detail}"));
-                        pending_resume.lock().unwrap().take();
-                    } else {
-                        let _ = events.send(PlayerEvent::Error { kind, detail });
-                    }
-                }
-                if !restarting {
+                if seek_target.read().await.is_none() {
                     break;
                 }
             }

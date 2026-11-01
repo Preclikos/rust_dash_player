@@ -49,13 +49,6 @@ async fn wait_for_video_window(window: &DirectWindow, direct: bool, stop_flag: &
     true
 }
 
-/// A video pipeline's fatal failure, left by the supervisor for the play()
-/// loop. The loop reports it as `PlayerEvent::Error` only when playback ends
-/// there: a seek or track switch that arrived meanwhile restarts the pipeline
-/// from the new position, and an error the viewer never sees the effect of
-/// must not reach the host (which shows it as fatal).
-pub(super) type FatalSlot = Arc<StdMutex<Option<(PlayerErrorKind, String)>>>;
-
 /// Long-lived task that owns the video pipeline for a single `play()` call.
 /// It runs one representation's decode at a time and switches on ABR request.
 ///
@@ -115,9 +108,6 @@ pub(super) async fn video_supervisor(
     // starts from this position instead of zero ("continue where we
     // stopped" semantics for the consumer's manual retry).
     pending_resume: Arc<StdMutex<Option<Duration>>>,
-    // Where a fatal failure is left for the play() loop, which reports it
-    // only if playback really ends there (see `FatalSlot`).
-    fatal: FatalSlot,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     // Pipeline failures (network death mid-stream, decoder errors) are
     // retried from the current playback position with backoff. The
@@ -288,7 +278,10 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         // checks stop_flag before emitting EOS).
                         *pending_resume.lock().unwrap() =
                             Some(Duration::from_millis(pos_now));
-                        *fatal.lock().unwrap() = Some((net_io::pipeline_error_kind(&detail), detail));
+                        let _ = events.send(PlayerEvent::Error {
+                            kind: net_io::pipeline_error_kind(&detail),
+                            detail,
+                        });
                         signal_stop(&stop_flag, &stop);
                         return Err("video pipeline retries exhausted".into());
                     }
@@ -550,7 +543,10 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 );
                 stats.debug.log("pipeline", format!("failed during an ABR prefetch: {detail}"));
                 *pending_resume.lock().unwrap() = Some(Duration::from_millis(pos_now));
-                *fatal.lock().unwrap() = Some((net_io::pipeline_error_kind(&detail), detail));
+                let _ = events.send(PlayerEvent::Error {
+                    kind: net_io::pipeline_error_kind(&detail),
+                    detail,
+                });
                 signal_stop(&stop_flag, &stop);
                 return Err("video pipeline failed during an ABR prefetch".into());
             }

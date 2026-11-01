@@ -3,6 +3,15 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.32
+
+### All platforms
+
+- **`Error` is sent at the moment of the failure again**, as before 0.2.31.
+  Holding a pipeline failure back when a seek or track switch restarted
+  playback hid real decoder failures from the host; the 0.2.31 change is
+  reverted.
+
 ## 0.2.31
 
 ### All platforms
