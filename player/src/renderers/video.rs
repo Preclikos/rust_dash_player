@@ -16,11 +16,11 @@ use wgpu::{Device, SurfaceConfiguration};
 use super::video_offscreen::{OffscreenTarget, OFFSCREEN_FORMAT};
 
 #[cfg(target_os = "windows")]
-mod video_directx;
+pub(crate) mod video_directx;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 mod video_frame;
 #[cfg(target_os = "linux")]
-mod video_vaapi;
+pub(crate) mod video_vaapi;
 // Vulkan import helper is shared by every backend that imports external GPU
 // memory through VK_*_external_memory_*: Windows (D3D11 shared handle),
 // Linux (DMA-BUF/VAAPI), and Android (AHardwareBuffer).

@@ -165,6 +165,179 @@ impl Drop for SharedHwDevice {
     }
 }
 
+/// Asks the hardware decoder about a video representation before playback
+/// (see `decoders::support`): the same device type, on the same GPU, that
+/// [`SharedHwDevice`] decodes with.
+pub(crate) struct VideoProbe {
+    device: SharedHwDevice,
+}
+
+impl VideoProbe {
+    /// `None` when no hw device opens (then nothing is pruned; configure
+    /// reports the failure as before).
+    pub(crate) fn open() -> Option<Self> {
+        match create_hwdevice_ctx() {
+            Ok(ctx) => Some(Self { device: SharedHwDevice { ctx } }),
+            Err(e) => {
+                log::warn!("[support] no hw device to probe with: {e}");
+                None
+            }
+        }
+    }
+
+    /// `Some(false)` only on a definite "cannot decode"; `None` when the
+    /// question could not be asked.
+    pub(crate) fn supports(&self, need: &super::support::VideoNeed) -> Option<bool> {
+        unsafe {
+            let dev = (*self.device.ctx).data as *mut ffmpeg_sys_next::AVHWDeviceContext;
+            if dev.is_null() || (*dev).hwctx.is_null() {
+                return None;
+            }
+            platform_supports(dev, self.device.ctx, need)
+        }
+    }
+}
+
+/// D3D11 video decoding: the profile must be on the device's list and take
+/// the output format, and a decoder must actually be created at this picture
+/// size, then dropped. The configuration count alone does not size-check
+/// (an Intel UHD driver lists configurations for 16384x16384); creating the
+/// decoder is how Chromium finds DXVA's resolution limits.
+#[cfg(target_os = "windows")]
+unsafe fn platform_supports(
+    dev: *mut ffmpeg_sys_next::AVHWDeviceContext,
+    _ctx: *mut AVBufferRef,
+    need: &super::support::VideoNeed,
+) -> Option<bool> {
+    use super::support::VideoCodecNeed;
+    use windows::core::{Interface, GUID};
+    use windows::Win32::Graphics::Direct3D11::{
+        ID3D11Device, ID3D11VideoDevice, D3D11_DECODER_PROFILE_H264_VLD_NOFGT, D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+        D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10, D3D11_VIDEO_DECODER_CONFIG, D3D11_VIDEO_DECODER_DESC,
+    };
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_FORMAT_P010};
+
+    let hwctx = (*dev).hwctx as *mut crate::renderers::video::video_directx::AVD3D11VADeviceContext;
+    let raw = (*hwctx).device;
+    let device = ID3D11Device::from_raw_borrowed(&raw)?;
+    let video: ID3D11VideoDevice = device.cast().ok()?;
+    let guid: GUID = match (need.codec, need.ten_bit) {
+        (VideoCodecNeed::Hevc, false) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN,
+        (VideoCodecNeed::Hevc, true) => D3D11_DECODER_PROFILE_HEVC_VLD_MAIN10,
+        (VideoCodecNeed::Avc { .. }, false) => D3D11_DECODER_PROFILE_H264_VLD_NOFGT,
+        // DXVA has no H.264 High 10 profile; FFmpeg's d3d11va cannot decode it.
+        (VideoCodecNeed::Avc { .. }, true) => return Some(false),
+    };
+    let profiles = video.GetVideoDecoderProfileCount();
+    let listed = (0..profiles).any(|i| video.GetVideoDecoderProfile(i).ok() == Some(guid));
+    if !listed {
+        return Some(false);
+    }
+    let format = if need.ten_bit { DXGI_FORMAT_P010 } else { DXGI_FORMAT_NV12 };
+    if !video.CheckVideoDecoderFormat(&guid, format).map(|b| b.as_bool()).unwrap_or(false) {
+        return Some(false);
+    }
+    let desc = D3D11_VIDEO_DECODER_DESC {
+        Guid: guid,
+        SampleWidth: need.width,
+        SampleHeight: need.height,
+        OutputFormat: format,
+    };
+    if !matches!(video.GetVideoDecoderConfigCount(&desc), Ok(n) if n > 0) {
+        return Some(false);
+    }
+    let mut config = D3D11_VIDEO_DECODER_CONFIG::default();
+    if video.GetVideoDecoderConfig(&desc, 0, &mut config).is_err() {
+        return Some(false);
+    }
+    Some(video.CreateVideoDecoder(&desc, &config).is_ok())
+}
+
+/// VAAPI: the profile must be on the driver's list and take a VLD (decode)
+/// config, and FFmpeg's frame constraints for that config give the largest
+/// surface the driver decodes into.
+#[cfg(target_os = "linux")]
+unsafe fn platform_supports(
+    dev: *mut ffmpeg_sys_next::AVHWDeviceContext,
+    ctx: *mut AVBufferRef,
+    need: &super::support::VideoNeed,
+) -> Option<bool> {
+    use super::support::VideoCodecNeed;
+    type VADisplay = *mut std::ffi::c_void;
+    extern "C" {
+        fn vaMaxNumProfiles(dpy: VADisplay) -> i32;
+        fn vaQueryConfigProfiles(dpy: VADisplay, profile_list: *mut i32, num_profiles: *mut i32) -> i32;
+        fn vaCreateConfig(
+            dpy: VADisplay,
+            profile: i32,
+            entrypoint: i32,
+            attrib_list: *mut std::ffi::c_void,
+            num_attribs: i32,
+            config_id: *mut u32,
+        ) -> i32;
+        fn vaDestroyConfig(dpy: VADisplay, config_id: u32) -> i32;
+    }
+    // va.h VAProfile / VAEntrypoint values.
+    const VA_PROFILE_H264_CONSTRAINED_BASELINE: i32 = 13;
+    const VA_PROFILE_H264_MAIN: i32 = 6;
+    const VA_PROFILE_H264_HIGH: i32 = 7;
+    const VA_PROFILE_HEVC_MAIN: i32 = 17;
+    const VA_PROFILE_HEVC_MAIN10: i32 = 18;
+    const VA_ENTRYPOINT_VLD: i32 = 1;
+
+    let hwctx = (*dev).hwctx as *mut crate::renderers::video::video_vaapi::AVVAAPIDeviceContext;
+    let display = (*hwctx).display as VADisplay;
+    if display.is_null() {
+        return None;
+    }
+    let profile = match need.codec {
+        VideoCodecNeed::Hevc if need.ten_bit => VA_PROFILE_HEVC_MAIN10,
+        VideoCodecNeed::Hevc => VA_PROFILE_HEVC_MAIN,
+        // No VA profile for High 10.
+        VideoCodecNeed::Avc { .. } if need.ten_bit => return Some(false),
+        VideoCodecNeed::Avc { profile_idc: 66 } => VA_PROFILE_H264_CONSTRAINED_BASELINE,
+        VideoCodecNeed::Avc { profile_idc: 77 } => VA_PROFILE_H264_MAIN,
+        VideoCodecNeed::Avc { .. } => VA_PROFILE_H264_HIGH,
+    };
+    let max = vaMaxNumProfiles(display);
+    if max <= 0 {
+        return None;
+    }
+    let mut list = vec![0i32; max as usize];
+    let mut n = 0i32;
+    if vaQueryConfigProfiles(display, list.as_mut_ptr(), &mut n) != 0 {
+        return None;
+    }
+    if !list[..n.clamp(0, max) as usize].contains(&profile) {
+        return Some(false);
+    }
+    let mut config = 0u32;
+    if vaCreateConfig(display, profile, VA_ENTRYPOINT_VLD, std::ptr::null_mut(), 0, &mut config) != 0 {
+        // The profile exists but not for decoding (encode-only).
+        return Some(false);
+    }
+    // AVVAAPIHWConfig { VAConfigID config_id; }
+    let hwconfig = ffmpeg_sys_next::av_hwdevice_hwconfig_alloc(ctx) as *mut u32;
+    let mut verdict = None;
+    if !hwconfig.is_null() {
+        *hwconfig = config;
+        let mut c = ffmpeg_sys_next::av_hwdevice_get_hwframe_constraints(ctx, hwconfig as *const _);
+        if !c.is_null() {
+            let (mw, mh) = ((*c).max_width, (*c).max_height);
+            verdict = if mw > 0 && mh > 0 {
+                Some(need.width as i32 <= mw && need.height as i32 <= mh)
+            } else {
+                // The driver reports no limit: the profile is there.
+                Some(true)
+            };
+            ffmpeg_sys_next::av_hwframe_constraints_free(&mut c);
+        }
+        ffmpeg_sys_next::av_free(hwconfig as *mut _);
+    }
+    vaDestroyConfig(display, config);
+    verdict
+}
+
 impl FfmpegHwDecoder {
     /// Legacy / fallback: this decoder owns a freshly-created hw-device.
     pub fn new() -> Self {
@@ -526,5 +699,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn video_probe_against_real_driver() {
+        // Same skip rule as above: no GPU, nothing to ask.
+        // Sizes are not asserted: some drivers (Intel UHD on D3D11) accept
+        // any size up to the texture limit and fail only when decoding.
+        use crate::decoders::support::VideoNeed;
+        let Some(probe) = VideoProbe::open() else {
+            eprintln!("video_probe: skipping live-driver check (no hw device)");
+            return;
+        };
+        let fhd = VideoNeed::from_codecs("hvc1.1.6.L120.90", 1920, 1080, Some(25.0)).unwrap();
+        let high10 = VideoNeed::from_codecs("avc1.6E0028", 1920, 1080, Some(25.0)).unwrap();
+        let huge = VideoNeed::from_codecs("hvc1.1.6.L186.90", 16384, 16384, Some(25.0)).unwrap();
+        eprintln!(
+            "video_probe: HEVC 1080p {:?}, H.264 High 10 {:?}, HEVC 16384x16384 {:?} (drivers differ on sizes)",
+            probe.supports(&fhd),
+            probe.supports(&high10),
+            probe.supports(&huge)
+        );
+        // Neither DXVA nor VAAPI has an H.264 High 10 decode profile.
+        assert_eq!(probe.supports(&high10), Some(false));
     }
 }

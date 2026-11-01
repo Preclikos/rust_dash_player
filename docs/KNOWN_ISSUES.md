@@ -43,6 +43,18 @@ moves) is composited on the CPU every frame, which has not been measured on
 a GLES 2.0 box. The mode was verified on a Google TV Streamer with the GPU
 renderer forced off, not on a Mali-450 device.
 
+## Decoder-capability pruning: what it cannot see
+
+`prepare()` removes the video representations the decoder refuses (see
+`docs/PITFALLS.md`). Gaps:
+
+- **Windows, Intel UHD:** the driver creates a D3D11 decoder at any size up
+  to the texture limit (16384), so only the codec profile is checked there
+  (an HEVC Main10 rung on a GPU without Main10 is removed; a too-large rung
+  is not).
+- **Apple:** no probe; VideoToolbox falls back to software decoding.
+- **Audio:** not probed.
+
 ## Android request filter has no method or body
 
 - **What:** Android's `RustPlayerProvider.PreparedRequest` carries `url` and

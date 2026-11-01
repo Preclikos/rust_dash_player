@@ -109,6 +109,15 @@ arrived first.
 - **A device that cannot decode the top rung.** ABR climbed to 2160p on an
   iPhone SE that presents 13 fps there. `DecodeOverloadDetector`
   (`player/src/abr.rs`) caps the ladder after sustained drops.
+- **A decoder that cannot open the top rung at all.** A Lenovo Tab M10 Plus
+  Gen 3 has no 4K decoder: the 4K rung failed at configure, as a fatal
+  decoder error on an audio switch. Rule: `decoders/support.rs` asks the
+  decoder that will be used about every video representation in `prepare()`
+  and removes what it refuses, before selection, ABR and the host's track
+  list (Android `MediaCodecList` + `areSizeAndRateSupported` + 10-bit
+  profile, Windows D3D11 video profiles + `CreateVideoDecoder` at the size,
+  Linux VAAPI profiles + surface limits, web `isConfigSupported`). Only a
+  definite "no" removes; a probe that refuses every rung removes nothing.
 
 ## Audio: Android PCM output (AudioTrack)
 

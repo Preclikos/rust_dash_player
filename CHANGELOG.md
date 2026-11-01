@@ -5,6 +5,23 @@ pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
 ## 0.2.32
 
+### Android, Windows, Linux
+
+- **Representations the decoder cannot play are removed before playback.**
+  `prepare()` now asks the hardware decoder the player will use about every
+  video representation and drops the ones it refuses, so they never reach
+  track selection, ABR or the host's track list (the web build already does
+  this with `isConfigSupported`). Android asks `MediaCodecList` for
+  the decoder `createDecoderByType` picks (`areSizeAndRateSupported`, and a
+  Main10 / High 10 profile for 10-bit); Windows asks the D3D11 video device
+  on the renderer's GPU (profile, output format, a decoder created at the
+  picture size); Linux asks VAAPI (profile, VLD entrypoint, surface size
+  limits). On a device without a 4K decoder (the report came from a Lenovo
+  Tab M10 Plus Gen 3) the 4K rung is removed instead of failing when ABR or
+  a rebuild reaches it. Only a definite "no" removes a
+  representation, and a probe that refuses every one removes none. Logged
+  as `[support] ...`. Known gaps in `docs/KNOWN_ISSUES.md`.
+
 ### All platforms
 
 - **`Error` is sent at the moment of the failure again**, as before 0.2.31.

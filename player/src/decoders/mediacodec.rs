@@ -147,6 +147,166 @@ fn uptime_ms() -> u64 {
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
 }
 
+/// The decoder `createDecoderByType(mime)` takes (the first one
+/// `MediaCodecList(REGULAR_CODECS)` lists for the mime), looked up once per
+/// process: walking the codec list costs ~0.2 s per walk on a Google TV
+/// Streamer (binder calls into the media service).
+struct DecoderCaps {
+    name: String,
+    video: jni::refs::Global<jni::objects::JObject<'static>>,
+    profiles: Vec<i32>,
+}
+
+/// `None` when the lookup itself failed (asked again next time),
+/// `Some(None)` when no decoder handles the mime.
+fn decoder_caps(mime: &'static str) -> Option<Option<Arc<DecoderCaps>>> {
+    use jni::objects::{JObjectArray, JString};
+    static FOUND: std::sync::Mutex<Vec<(&'static str, Option<Arc<DecoderCaps>>)>> = std::sync::Mutex::new(Vec::new());
+    if let Some((_, caps)) = FOUND.lock().unwrap().iter().find(|(m, _)| *m == mime) {
+        return Some(caps.clone());
+    }
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+    let found = vm
+        .attach_current_thread(|env| -> Result<Option<DecoderCaps>, jni::errors::Error> {
+            // MediaCodecList(REGULAR_CODECS = 0)
+            let list = env.new_object(jni::jni_str!("android/media/MediaCodecList"), jni::jni_sig!("(I)V"), &[0i32.into()])?;
+            let infos = env
+                .call_method(&list, jni::jni_str!("getCodecInfos"), jni::jni_sig!("()[Landroid/media/MediaCodecInfo;"), &[])?
+                .l()?;
+            let infos = env.cast_local::<JObjectArray>(infos)?;
+            for i in 0..infos.len(env)? {
+                let info = infos.get_element(env, i)?;
+                if env.call_method(&info, jni::jni_str!("isEncoder"), jni::jni_sig!("()Z"), &[])?.z()? {
+                    continue;
+                }
+                let types = env
+                    .call_method(&info, jni::jni_str!("getSupportedTypes"), jni::jni_sig!("()[Ljava/lang/String;"), &[])?
+                    .l()?;
+                let types = env.cast_local::<JObjectArray>(types)?;
+                let mut handles = false;
+                for t in 0..types.len(env)? {
+                    let element = types.get_element(env, t)?;
+                    let jt = env.cast_local::<JString>(element)?;
+                    if jt.try_to_string(env)?.eq_ignore_ascii_case(mime) {
+                        handles = true;
+                        break;
+                    }
+                }
+                if !handles {
+                    continue;
+                }
+                let name = env
+                    .call_method(&info, jni::jni_str!("getName"), jni::jni_sig!("()Ljava/lang/String;"), &[])?
+                    .l()?;
+                let name = env.cast_local::<JString>(name)?.try_to_string(env)?;
+                let jmime = env.new_string(mime)?;
+                let caps = env
+                    .call_method(
+                        &info,
+                        jni::jni_str!("getCapabilitiesForType"),
+                        jni::jni_sig!("(Ljava/lang/String;)Landroid/media/MediaCodecInfo$CodecCapabilities;"),
+                        &[(&jmime).into()],
+                    )?
+                    .l()?;
+                let video = env
+                    .call_method(
+                        &caps,
+                        jni::jni_str!("getVideoCapabilities"),
+                        jni::jni_sig!("()Landroid/media/MediaCodecInfo$VideoCapabilities;"),
+                        &[],
+                    )?
+                    .l()?;
+                if video.is_null() {
+                    return Ok(None);
+                }
+                let mut profiles = Vec::new();
+                let levels = env
+                    .get_field(
+                        &caps,
+                        jni::jni_str!("profileLevels"),
+                        jni::jni_sig!("[Landroid/media/MediaCodecInfo$CodecProfileLevel;"),
+                    )?
+                    .l()?;
+                if !levels.is_null() {
+                    let levels = env.cast_local::<JObjectArray>(levels)?;
+                    for l in 0..levels.len(env)? {
+                        let pl = levels.get_element(env, l)?;
+                        profiles.push(env.get_field(&pl, jni::jni_str!("profile"), jni::jni_sig!("I"))?.i()?);
+                    }
+                }
+                let video = env.new_global_ref(&video)?;
+                return Ok(Some(DecoderCaps { name, video, profiles }));
+            }
+            Ok(None)
+        });
+    let caps = match found {
+        Ok(found) => found.map(Arc::new),
+        // A JNI failure is not an answer: ask again next time.
+        Err(e) => {
+            log::warn!("[support] {mime}: codec list lookup failed: {e}");
+            return None;
+        }
+    };
+    match &caps {
+        Some(c) => log::info!("[support] {mime} decodes on {}", c.name),
+        None => log::info!("[support] no decoder for {mime}"),
+    }
+    FOUND.lock().unwrap().push((mime, caps.clone()));
+    Some(caps)
+}
+
+/// Whether the decoder this player will use can play `need` (see
+/// `decoders::support`), asked like ExoPlayer asks it:
+/// `areSizeAndRateSupported` (`isSizeSupported` without a frame rate) and,
+/// for 10-bit, a Main10 / High 10 profile. `None` when the question could not
+/// be asked.
+pub(crate) fn probe_video(need: &super::support::VideoNeed) -> Option<bool> {
+    use super::support::VideoCodecNeed;
+    // MediaCodecInfo.CodecProfileLevel: HEVCProfileMain10, Main10HDR10,
+    // Main10HDR10Plus; AVCProfileHigh10.
+    const HEVC_MAIN10: [i32; 3] = [0x2, 0x1000, 0x2000];
+    const AVC_HIGH10: [i32; 1] = [0x10];
+    let (mime, ten_bit_profiles): (&'static str, &[i32]) = match need.codec {
+        VideoCodecNeed::Hevc => ("video/hevc", &HEVC_MAIN10),
+        VideoCodecNeed::Avc { .. } => ("video/avc", &AVC_HIGH10),
+    };
+    let caps = match decoder_caps(mime)? {
+        Some(c) => c,
+        None => return Some(false),
+    };
+    let ctx = ndk_context::android_context();
+    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+    let (w, h) = (need.width as i32, need.height as i32);
+    let size_ok = vm
+        .attach_current_thread(|env| -> Result<bool, jni::errors::Error> {
+            match need.fps() {
+                Some(fps) => env
+                    .call_method(
+                        caps.video.as_obj(),
+                        jni::jni_str!("areSizeAndRateSupported"),
+                        jni::jni_sig!("(IID)Z"),
+                        &[w.into(), h.into(), fps.into()],
+                    )?
+                    .z(),
+                None => env
+                    .call_method(caps.video.as_obj(), jni::jni_str!("isSizeSupported"), jni::jni_sig!("(II)Z"), &[w.into(), h.into()])?
+                    .z(),
+            }
+        })
+        .ok()?;
+    if !size_ok {
+        log::info!("[support] {}: {need} exceeds the decoder's size / frame-rate range", caps.name);
+        return Some(false);
+    }
+    // Nothing declared: do not guess.
+    if need.ten_bit && !caps.profiles.is_empty() && !caps.profiles.iter().any(|p| ten_bit_profiles.contains(p)) {
+        log::info!("[support] {}: no 10-bit profile for {need}", caps.name);
+        return Some(false);
+    }
+    Some(true)
+}
+
 /// `max-input-size` for a picture of `width`×`height`: ExoPlayer's HEVC rule
 /// (4:2:0 at a minimum compression ratio of 2), floored at 1 MiB. Without it
 /// the codec picks its own default, and the `video/dolby-vision` decoders on
