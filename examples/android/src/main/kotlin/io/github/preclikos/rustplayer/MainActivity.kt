@@ -461,6 +461,35 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 )
                 player.selectAudio(adapt, repr)
             }
+            "audio_during_abr" -> {
+                // A soft (ABR-style) video switch, then an audio switch while
+                // it is still in flight: the delay walks 0.2-2.7 s across steps
+                // to land in every phase of the swap (prefetch, prime,
+                // boundary wait, teardown).
+                val v = pickAlternating("video")
+                val a = tracks.optJSONArray("audio")
+                if (v == null || a == null || a.length() < 2) {
+                    scenarioAbort("needs video tracks and two audio tracks")
+                    return
+                }
+                traceMark(
+                    "select", "kind" to "video", "mode" to "soft",
+                    "adapt" to v.optInt("adapt"), "repr" to v.optInt("repr"),
+                    "label" to v.optString("label"), "src" to "scenario", "step" to step,
+                )
+                player.selectVideoSoft(v.optInt("adapt"), v.optInt("repr"))
+                val at = a.getJSONObject(step % 2)
+                val delayMs = 200L + (step * 397L) % 2500L
+                playPauseButton.postDelayed({
+                    traceMark(
+                        "select", "kind" to "audio", "mode" to "manual",
+                        "adapt" to at.optInt("adapt"), "repr" to at.optInt("repr"),
+                        "label" to at.optString("label"), "src" to "scenario", "step" to step,
+                        "delay_ms" to delayMs,
+                    )
+                    player.selectAudio(at.optInt("adapt"), at.optInt("repr"))
+                }, delayMs)
+            }
             "manual_sub" -> {
                 val arr = tracks.optJSONArray("text")
                 if (arr == null || arr.length() == 0) {

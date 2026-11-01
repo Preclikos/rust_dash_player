@@ -3,6 +3,19 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.31
+
+### All platforms
+
+- **`Error` only when playback really ends.** A video pipeline that failed
+  for good (retries exhausted, or a failure during an ABR switch) reported
+  `PlayerEvent::Error` at once, even when a seek or track switch that came
+  in meanwhile restarted playback from its position a moment later. Hosts
+  that show `Error` as fatal then blocked a film that played on (reported
+  on an audio switch on a Lenovo Tab M10 Plus Gen 3). The failure is now
+  reported after the pipeline has stopped, and only when no restart
+  follows; otherwise it is logged (`failure superseded by a restart`).
+
 ## 0.2.30
 
 ### Android
