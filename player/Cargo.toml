@@ -165,9 +165,14 @@ web-sys = { version = "0.3", features = [
 # rustc 1.95+). 9.0 matches the newer FFmpeg enum variants with wildcard arms,
 # which the vendored 8.1.0 patch used to add. The bindings are generated
 # against the system headers, so the FFmpeg 7.x libs the platforms ship work.
+# ffmpeg-sys-next is held at exactly 9.0.0: 9.0.1 moves to bindgen 0.73,
+# which emits the AMX `__tile1024i_str` with both `packed(64)` and
+# `align(64)` against the MinGW headers (E0587 + a failing layout assert),
+# so the Windows build breaks. The pin also covers desktop hosts, which get
+# ffmpeg-sys-next only through this crate.
 [target.'cfg(any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "ios"))'.dependencies]
 ffmpeg-next = { version = "9.0" }
-ffmpeg-sys-next = { version = "9.0" }
+ffmpeg-sys-next = { version = "=9.0.0" }
 
 # Win/Linux: native-tls (system OpenSSL/Schannel). macOS prefers rustls
 # so we don't drag native-tls + OpenSSL into the build.
