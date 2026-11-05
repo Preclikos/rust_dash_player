@@ -47,10 +47,10 @@ fn dir() -> PathBuf {
 
 fn decode_png(path: &std::path::Path) -> Option<Vec<u8>> {
     let file = std::fs::File::open(path).ok()?;
-    let mut dec = png::Decoder::new(file);
+    let mut dec = png::Decoder::new(std::io::BufReader::new(file));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().ok()?;
-    let mut buf = vec![0; reader.output_buffer_size()];
+    let mut buf = vec![0; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     let ch = info.color_type.samples();
     let mut rgb = Vec::with_capacity((info.width * info.height * 3) as usize);

@@ -3,6 +3,21 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.2.33
+
+### All platforms
+
+- Dependency refresh: `harfrust` 0.15 and `skrifa` 0.49 (ASS shaping and
+  font reading; output unchanged against the libass reference frames),
+  lockfile patch updates.
+
+### Desktop hosts
+
+- **`ffmpeg-sys-next` is held at exactly 9.0.0.** 9.0.1 generates bindings
+  that do not compile on Windows. Hosts that depend on the player get the
+  pin with this tag; on an older tag, run
+  `cargo update -p ffmpeg-sys-next --precise 9.0.0` after a `cargo update`.
+
 ## 0.2.32
 
 ### Android, Windows, Linux

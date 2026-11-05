@@ -324,10 +324,10 @@ fn libass_regression() {
                 continue;
             };
             let s = parsed.script.unwrap();
-            let mut dec = png::Decoder::new(std::fs::File::open(&png_path).unwrap());
+            let mut dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&png_path).unwrap()));
             dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
             let mut reader = dec.read_info().unwrap();
-            let mut buf = vec![0; reader.output_buffer_size()];
+            let mut buf = vec![0; reader.output_buffer_size().unwrap()];
             let info = reader.next_frame(&mut buf).unwrap();
             let (w, h, ch) = (info.width as usize, info.height as usize, info.color_type.samples());
             // reference: straight alpha over grey

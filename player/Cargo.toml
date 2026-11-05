@@ -67,8 +67,8 @@ unicode-normalization = "0.1"
 # skrifa reads glyph outlines, metrics and name tables from the same
 # read-fonts parser, zeno rasterizes and strokes paths into exact-coverage
 # 8-bit masks, unicode-bidi orders mixed-direction text.
-harfrust = "0.14"
-skrifa = "0.48"
+harfrust = "0.15"
+skrifa = "0.49"
 zeno = "0.3"
 unicode-bidi = "0.3"
 # Unicode script of each character, for splitting shaping runs by script
@@ -265,7 +265,7 @@ env_logger = "0.11"
 # what makes second-scale liveness thresholds testable without sleeping for them.
 tokio = { version = "1.52", features = ["test-util", "macros", "rt"] }
 # ASS golden tests read the libass reference frames (tests/ass_golden/ref).
-png = "0.17"
+png = "0.18"
 
 [build-dependencies]
 cc = "1"
