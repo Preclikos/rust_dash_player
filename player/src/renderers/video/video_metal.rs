@@ -369,6 +369,8 @@ fn build_plane_texture(
                 height,
                 depth: 1,
             },
+            // `retained` keeps the MTLTexture alive; nothing else to release.
+            None,
         )
     };
 

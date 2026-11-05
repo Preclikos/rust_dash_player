@@ -101,7 +101,7 @@ impl HdrOutputPipelines {
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_main"),
-                    buffers: std::slice::from_ref(&vertex_layout),
+                    buffers: &[Some(vertex_layout.clone())],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {

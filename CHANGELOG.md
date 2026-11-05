@@ -3,7 +3,7 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
-## 0.2.33
+## 0.3.0
 
 ### All platforms
 
