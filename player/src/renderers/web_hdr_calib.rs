@@ -304,7 +304,11 @@ pub(crate) async fn calibrate(device: &wgpu::Device, queue: &wgpu::Queue) -> Res
     rx.await
         .map_err(|_| "map_async callback dropped".to_string())?
         .map_err(|e| format!("map_async failed: {e:?}"))?;
-    let bytes = readback.slice(..).get_mapped_range().to_vec();
+    let bytes = readback
+        .slice(..)
+        .get_mapped_range()
+        .map_err(|e| format!("get_mapped_range failed: {e:?}"))?
+        .to_vec();
     readback.unmap();
     evaluate(&bytes, BYTES_PER_ROW as usize)
 }

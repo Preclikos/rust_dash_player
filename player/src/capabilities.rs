@@ -153,6 +153,7 @@ pub async fn probe_capabilities() -> PlayerCapabilities {
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
             compatible_surface: None,
         })
         .await;

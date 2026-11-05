@@ -901,12 +901,13 @@ pub fn create_texture_from_dx12_resource(
         }
 
         log::trace!("[dx12_wrap] before create_texture_from_hal");
-        // wgpu 29.0.3: create_texture_from_hal derives HAL usage from the
-        // descriptor; the old explicit `TextureUses` hint arg was removed. Make
-        // the descriptor advertise the same intent (sampling + copy-src).
+        // create_texture_from_hal derives HAL usage from the descriptor, so
+        // the descriptor advertises the intent (sampling + copy-src). Initial
+        // state UNINITIALIZED is what wgpu 29 assumed for every wrap.
         let mut desc = desc.clone();
         desc.usage |= wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
-        let result = device.create_texture_from_hal::<Dx12>(texture, &desc);
+        let result =
+            device.create_texture_from_hal::<Dx12>(texture, &desc, wgpu::TextureUses::UNINITIALIZED);
         if trace {
             log::trace!("[dx12_wrap] create_texture_from_hal returned; device post-check:");
             log_dx12_device_removed_reason(device);
@@ -1198,6 +1199,7 @@ mod tests {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .ok()?;
         let wanted = wgpu::Features::TEXTURE_FORMAT_NV12 | extra;
@@ -1303,7 +1305,7 @@ mod tests {
         let slice = buf.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let _ = dev.poll(wgpu::PollType::wait_indefinitely());
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         (0..h).flat_map(|y| data[(y * padded) as usize..(y * padded + w * bpp) as usize].to_vec()).collect()
     }
 

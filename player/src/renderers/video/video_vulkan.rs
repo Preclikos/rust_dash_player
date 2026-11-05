@@ -74,6 +74,9 @@ pub fn create_texture_from_vk_image(
                 view_formats: &[],
                 usage: api_usage,
             },
+            // Same as before wgpu 30: the tracker treats the image as
+            // UNINITIALIZED (layout UNDEFINED) on its first barrier.
+            wgpu::TextureUses::UNINITIALIZED,
         )
     }
 }

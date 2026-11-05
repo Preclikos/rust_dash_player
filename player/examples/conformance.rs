@@ -165,6 +165,7 @@ async fn headless_gpu() -> (wgpu::Device, wgpu::Queue, wgpu::Backend) {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
     {

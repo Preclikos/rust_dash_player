@@ -20,6 +20,17 @@ These are not bugs in the player, but breaking them reproduces old bugs.
 | **Choose languages at start, not after.** Pass `preferredAudioLang` / `preferredSubtitleLang` to `start`. | Selecting audio after playback starts is a seek-rebuild; on a resume it can stall direct-mode decode. | `RustPlayer.start`, `StartConfig` |
 | **Provider hooks may block, but must return.** `onRequest`/`resolveKey` run on the blocking pool. | A hook that never returns stalls that request until the segment retry budget runs out. | `platform/android/src/lib.rs` |
 
+## Windows Vulkan: validation warning on the D3D11 import wait
+
+With the Vulkan validation layer installed, rendering D3D11VA frames on
+Vulkan (`--vulkan`, a desktop host's Vulkan option) logs
+`VUID-vkQueueSubmit-pWaitSemaphores-03238` about once per second: a
+submit waits on wgpu's relay semaphore, which depends on the timeline
+wait for the decoder's copy fence (`Queue::add_wait_semaphore`) before
+that fence value is signalled. Frames render correctly and DX12 is not
+affected (wgpu 29 and 30 alike). Where: `video_directx.rs`
+(`VulkanImportPool`).
+
 ## GPUs without OpenGL ES 3.0 play without a GPU (Android)
 
 The Android renderer runs on wgpu's GL backend, which needs OpenGL ES 3.0.

@@ -364,7 +364,7 @@ impl VideoRenderer {
             .create_view(&wgpu::TextureViewDescriptor { format: Some(format), ..Default::default() });
         self.draw_direct_overlay(&view, generation, overlay.as_ref(), &cue_parent);
         self.pre_present_notify();
-        texture.present();
+        self.queue.present(texture);
     }
 
     /// Offscreen direct mode: publish a transparent texture carrying only

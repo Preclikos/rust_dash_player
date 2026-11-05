@@ -181,6 +181,7 @@ async fn shared_gpu(backend_choice: &str) -> SharedGpu {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         })
         .await
         .expect("no suitable wgpu adapter");
@@ -283,7 +284,7 @@ fn main() {
 
     let gpu = pollster::block_on(shared_gpu(&args.backend));
     slint::BackendSelector::new()
-        .require_wgpu_29(slint::wgpu_29::WGPUConfiguration::Manual {
+        .require_wgpu_30(slint::wgpu_30::WGPUConfiguration::Manual {
             instance: gpu.instance.clone(),
             adapter: gpu.adapter.clone(),
             device: gpu.device.clone(),

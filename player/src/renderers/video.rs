@@ -692,6 +692,7 @@ impl VideoRenderer {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
+                apply_limit_buckets: false,
             })
             .await
             .map_err(|e| format!("no GPU adapter (wgpu: {e})"))?;
@@ -852,6 +853,7 @@ impl VideoRenderer {
             height: size.height,
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
 
@@ -898,7 +900,7 @@ impl VideoRenderer {
                 vertex: wgpu::VertexState {
                     module: &module,
                     entry_point: Some("vs_main"),
-                    buffers: &[Vertex::desc()],
+                    buffers: &[Some(Vertex::desc())],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1246,7 +1248,7 @@ impl VideoRenderer {
                 vertex: wgpu::VertexState {
                     module,
                     entry_point: Some("vs_main"),
-                    buffers: &[Vertex::desc()],
+                    buffers: &[Some(Vertex::desc())],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1704,7 +1706,7 @@ impl VideoRenderer {
         }
         self.queue.submit([]);
         self.pre_present_notify();
-        surface_texture.present();
+        self.queue.present(surface_texture);
     }
 
     /// Last known drawable size (device pixels), kept current by the host via
@@ -2480,7 +2482,7 @@ impl VideoRenderer {
                 .await;
 
                 self.pre_present_notify();
-                surface_texture.present();
+                self.queue.present(surface_texture);
                 if is_p010_dbg {
                     log::trace!("[p010_render] step 8 OK: frame presented");
                 }
@@ -2729,7 +2731,7 @@ impl VideoRenderer {
             .await;
 
             self.pre_present_notify();
-            surface_texture.present();
+            self.queue.present(surface_texture);
         }
     }
 
@@ -2847,7 +2849,7 @@ impl VideoRenderer {
             }
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
-            surface_texture.present();
+            self.queue.present(surface_texture);
             // Drain deferred destruction here too (see the main path below) —
             // this degraded clear-loop runs every frame when renderer init
             // failed, so it would otherwise accumulate for the whole session.
@@ -2995,7 +2997,7 @@ impl VideoRenderer {
         // then present — the hook fires inside present() and draws the OES quad.
         self.queue.submit([]);
         self.pre_present_notify();
-        surface_texture.present();
+        self.queue.present(surface_texture);
 
         // Keep this AHB alive for one extra frame. The GPU may still be sampling
         // from the OES texture after eglSwapBuffers returns; if we drop the AHB
@@ -3127,7 +3129,7 @@ impl VideoRenderer {
             }
             self.queue.submit([encoder.finish()]);
             self.pre_present_notify();
-            surface_texture.present();
+            self.queue.present(surface_texture);
             // Drain deferred destruction here too (see the main path below) —
             // this degraded clear-loop runs every frame when renderer init
             // failed, so it would otherwise accumulate for the whole session.
@@ -3262,7 +3264,7 @@ impl VideoRenderer {
         }
         self.queue.submit([encoder.finish()]);
         self.pre_present_notify();
-        surface_texture.present();
+        self.queue.present(surface_texture);
 
         // Same one-frame keepalive contract as the GLES path, plus the
         // VkDeviceMemory cleanup the GLES path doesn't need: AHB stays

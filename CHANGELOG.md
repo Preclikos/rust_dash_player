@@ -7,12 +7,24 @@ pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
 ### All platforms
 
+- **wgpu 30.** The renderer moves to the Preclikos wgpu fork at tag
+  `v30.0.1-fork` (upstream 30.0.1 plus the Android GLES present hook, the
+  Vulkan AHardwareBuffer extensions and the Win32 external semaphore; the
+  other former fork patches are upstream now). Imported decoder textures
+  keep the wrap state wgpu 29 used, so rendering is unchanged.
 - Dependency refresh: `harfrust` 0.15 and `skrifa` 0.49 (ASS shaping and
   font reading; output unchanged against the libass reference frames),
   lockfile patch updates.
 
 ### Desktop hosts
 
+- **Hosts that share the wgpu device move to wgpu 30 with this tag.** A
+  Slint host needs Slint 1.18 with `unstable-wgpu-30` (`require_wgpu_30`,
+  `slint::wgpu_30`) and `[patch.crates-io] wgpu = { git =
+  "https://github.com/Preclikos/wgpu.git", tag = "v30.0.1-fork" }`. wgpu 30
+  API changes a host hits: `RequestAdapterOptions::apply_limit_buckets`,
+  `SurfaceConfiguration::color_space`, `queue.present(surface_texture)`,
+  `Option` vertex buffer slots, `get_mapped_range()` returning a `Result`.
 - **`ffmpeg-sys-next` is held at exactly 9.0.0.** 9.0.1 generates bindings
   that do not compile on Windows. Hosts that depend on the player get the
   pin with this tag; on an older tag, run

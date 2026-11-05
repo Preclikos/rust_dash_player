@@ -126,7 +126,7 @@ fn render(dev: &wgpu::Device, queue: &wgpu::Queue, entry: &str, y: u16) -> [f32;
         vertex: wgpu::VertexState {
             module: &module,
             entry_point: Some("vs_main"),
-            buffers: &[vertex_layout],
+            buffers: &[Some(vertex_layout)],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -201,7 +201,7 @@ fn render(dev: &wgpu::Device, queue: &wgpu::Queue, entry: &str, y: u16) -> [f32;
     let slice = readback.slice(..);
     slice.map_async(wgpu::MapMode::Read, |r| r.unwrap());
     dev.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().unwrap();
     // Texel (1, 1): away from any edge filtering.
     let px: &[u16] = bytemuck::cast_slice(&data[256 + 8..256 + 16]);
     let f = |h: u16| half_to_f32(h);
