@@ -129,6 +129,8 @@ pub(super) async fn text_play<V: VideoSink>(
     // the player's selection counter and the value it had for this run
     target: (Arc<AtomicU64>, u64),
     position_ms: Arc<AtomicU64>,
+    // where manifest fonts are cached (`Player::set_font_cache_dir`)
+    font_cache_dir: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let epoch_at_start = stop_epoch.load(Ordering::SeqCst);
     let stopped = || stop_epoch.load(Ordering::SeqCst) != epoch_at_start;
@@ -172,20 +174,22 @@ pub(super) async fn text_play<V: VideoSink>(
         // Fonts the manifest lists for the track, before the first frame so
         // it doesn't flash up in the fallback face. Without an essential one
         // (DVB EssentialProperty) the track is not shown at all; a
-        // supplemental one falls back to another face.
-        for font in &text_representation.fonts {
-            match http.get(font.url.clone(), RequestKind::InitSegment).await {
+        // supplemental one falls back to another face. Fetched in parallel
+        // and through the host's font cache directory when one is set.
+        let fetched = super::font_cache::fetch_fonts(&text_representation.fonts, &http, font_cache_dir).await;
+        if stopped() || !still_selected(&active) {
+            return Ok(());
+        }
+        for (font, res) in text_representation.fonts.iter().zip(fetched) {
+            match res {
                 Ok(bytes) => {
-                    let faces = video_sink.add_subtitle_font(bytes.to_vec());
+                    let faces = video_sink.add_subtitle_font(bytes);
                     log::info!("[subs] font {} ({:?}): {} faces", font.url, font.family, faces);
                 }
                 Err(e) if font.essential => {
                     return Err(SubtitleLoadError::fetch(&format!("essential font {}", font.url), e));
                 }
                 Err(e) => log::info!("[subs] font {} not loaded: {}", font.url, e),
-            }
-            if stopped() || !still_selected(&active) {
-                return Ok(());
             }
         }
         // Through the sidecar parser for its charset detection: `.ass`

@@ -46,6 +46,10 @@ impl ApplicationHandler for App {
         let mut player =
             Player::new_from_raw_handle(window_handle, display_handle, size.width, size.height);
         player.adopt_manifest_prefetch(prefetch);
+        // RUST_PLAYER_FONT_CACHE=<dir>: cache the manifest's subtitle fonts there.
+        if let Ok(dir) = std::env::var("RUST_PLAYER_FONT_CACHE") {
+            player.set_font_cache_dir(Some(dir.into()));
+        }
 
         // Keep winit's frame-pacing hint: call pre_present_notify right before
         // each present from inside the player's render loop.

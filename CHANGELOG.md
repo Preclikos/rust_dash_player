@@ -3,6 +3,20 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.1
+
+### All platforms
+
+- **Subtitle font cache.** The fonts a manifest lists for an ASS track
+  (DVB font download) now download in parallel, and with
+  `Player::set_font_cache_dir` (Android `RustPlayer.fontCacheDir`, iOS
+  `RustPlayer.fontCacheDirectory`) they are kept on disk, so the next
+  episode naming the same font reads it from there. Off by default; the
+  host bounds the folder (oldest by modification time). See
+  `PLAYER_INTEGRATION.md` §9.
+- The same subtitle font added twice (a track picked again) is no longer
+  kept twice in memory.
+
 ## 0.3.0
 
 ### All platforms

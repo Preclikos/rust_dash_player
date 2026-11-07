@@ -133,6 +133,7 @@ public final class RustPlayer {
             )
         }
         if handle != nil { callbackBox = box } else { box.release(); removeVideoLayer() }
+        if fontCacheDirectory != nil { applyFontCacheDirectory() }
         // iOS fails the video layer in the background (-11847); the player
         // falls back to its own renderer. Re-installing the layer on return
         // re-arms direct mode and rebuilds the pipeline onto it.
@@ -342,6 +343,26 @@ public final class RustPlayer {
     public func clearSubtitles() { handle.map { rustplayer_player_clear_subtitles($0) } }
 
     // --- generic knobs ---
+
+    /// Directory where the subtitle fonts a manifest lists are cached, so the
+    /// next episode naming the same font reads it from disk (nil = no cache,
+    /// the default). Use a folder of its own under `Caches`. The player only
+    /// adds files and refreshes their modification date on use; limiting the
+    /// size is up to the app (delete the oldest files by modification date,
+    /// or the whole folder, at any time). Takes effect from the next subtitle
+    /// track selection; set it before `start` so the first track uses it too.
+    public var fontCacheDirectory: URL? {
+        didSet { applyFontCacheDirectory() }
+    }
+
+    private func applyFontCacheDirectory() {
+        guard let handle else { return }
+        if let dir = fontCacheDirectory {
+            dir.path.withCString { rustplayer_player_set_font_cache_dir(handle, $0) }
+        } else {
+            rustplayer_player_set_font_cache_dir(handle, nil)
+        }
+    }
 
     /// ARGB ints (like Android `Color` / ExoPlayer `CaptionStyleCompat`).
     public func setSubtitleStyle(textArgb: Int32, outlineArgb: Int32, sizeScale: Float) {

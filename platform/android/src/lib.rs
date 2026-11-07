@@ -762,6 +762,24 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSe
     })
 }
 
+/// Directory for the manifest's subtitle fonts (null / empty = no cache).
+/// See `Player::set_font_cache_dir`.
+#[no_mangle]
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetFontCacheDir<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+    dir: JString<'local>,
+) {
+    with_env_or("nativeSetFontCacheDir", &mut env, (), move |env| {
+        let Some(h) = (unsafe { handle_ref(handle) }) else { return };
+        let dir = if dir.is_null() { String::new() } else { dir.try_to_string(env).unwrap_or_default() };
+        h.bridge
+            .player()
+            .set_font_cache_dir((!dir.is_empty()).then(|| std::path::PathBuf::from(dir)));
+    })
+}
+
 #[no_mangle]
 pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetAudioTrack(
     _env: EnvUnowned,

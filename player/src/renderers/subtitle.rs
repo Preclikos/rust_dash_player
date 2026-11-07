@@ -1378,7 +1378,16 @@ impl SubtitleOverlay {
     /// frames on screen are re-rendered with it.
     pub fn add_ass_font(&self, bytes: Vec<u8>) -> usize {
         let shared: Arc<[u8]> = bytes.as_slice().into();
-        self.ass_fonts.lock().unwrap().push(Arc::clone(&shared));
+        {
+            // The same font again (the track picked again, the next episode
+            // naming it too): the renderer already has it, so do not keep a
+            // second copy for the offload.
+            let mut kept = self.ass_fonts.lock().unwrap();
+            if kept.iter().any(|f| f[..] == shared[..]) {
+                return 0;
+            }
+            kept.push(Arc::clone(&shared));
+        }
         if let Some(off) = self.offload.lock().unwrap().as_ref() {
             off.target.add_font(shared);
         }

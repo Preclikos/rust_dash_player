@@ -63,5 +63,6 @@ object NativeBridge {
     external fun nativeSetTestPresentSkewPpm(handle: Long, ppm: Long)
     external fun nativeSetTestPresentOffsetPercent(handle: Long, percent: Long)
     external fun nativeSetSubtitleStyle(handle: Long, textArgb: Int, outlineArgb: Int, sizeScale: Float)
+    external fun nativeSetFontCacheDir(handle: Long, dir: String?)
     external fun nativeSetVerboseLogging(enabled: Boolean)
 }

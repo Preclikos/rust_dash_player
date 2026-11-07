@@ -88,6 +88,10 @@ void rustplayer_player_clear_subtitles(void *handle);
 // Generic knobs.
 void rustplayer_player_set_subtitle_style(void *handle, int32_t text_argb, int32_t outline_argb, float size_scale);
 void rustplayer_player_set_subtitle_safe_inset_bottom(void *handle, uint32_t bottom_px);
+// Directory for the manifest's subtitle fonts (UTF-8 path; NULL or "" = no
+// cache). The player only adds files and refreshes their mtime on use; the
+// host limits the size (delete oldest by mtime, or the whole directory).
+void rustplayer_player_set_font_cache_dir(void *handle, const char *dir);
 // HDR formats the display presents natively (bit 1 = HDR10, bit 2 = HLG).
 // Bit 1 set → PQ is handed to the display through an EDR layer instead of
 // being tonemapped to SDR. 0 = SDR display (tonemap). Next frame onward.

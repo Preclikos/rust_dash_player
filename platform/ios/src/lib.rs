@@ -630,6 +630,24 @@ pub extern "C" fn rustplayer_player_set_subtitle_style(
     })
 }
 
+/// Directory for the manifest's subtitle fonts (UTF-8 path, null = no
+/// cache). See `Player::set_font_cache_dir`.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_font_cache_dir(handle: *mut c_void, dir: *const c_char) {
+    ffi_guard("rustplayer_player_set_font_cache_dir", (), move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return;
+        };
+        let dir = if dir.is_null() {
+            None
+        } else {
+            let s = unsafe { CStr::from_ptr(dir) }.to_string_lossy().into_owned();
+            (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+        };
+        h.bridge.player().set_font_cache_dir(dir);
+    })
+}
+
 #[no_mangle]
 pub extern "C" fn rustplayer_player_set_subtitle_safe_inset_bottom(handle: *mut c_void, bottom_px: u32) {
     ffi_guard("rustplayer_player_set_subtitle_safe_inset_bottom", (), move || {

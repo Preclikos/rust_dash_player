@@ -595,6 +595,9 @@ pub struct Player<V: VideoSink = DefaultVideoSink, A: AudioSink = AudioRenderer>
     /// the same track was picked again (its cues would arrive twice).
     subtitle_selection: Arc<AtomicU64>,
     subtitle_hold: Arc<SubtitleHold>,
+    /// Where manifest (DVB) subtitle fonts are cached; `None` = no cache.
+    /// See `set_font_cache_dir`.
+    font_cache_dir: Arc<StdMutex<Option<std::path::PathBuf>>>,
 
     /// Subtitle tracks the host added from its own bytes via
     /// `add_external_subtitle_track`, kept beside the manifest's rather
@@ -705,6 +708,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
             subtitle_representation: Arc::clone(&self.subtitle_representation),
             subtitle_selection: Arc::clone(&self.subtitle_selection),
             subtitle_hold: Arc::clone(&self.subtitle_hold),
+            font_cache_dir: Arc::clone(&self.font_cache_dir),
             external_text: Arc::clone(&self.external_text),
             next_external_id: Arc::clone(&self.next_external_id),
             video_output_window: Arc::clone(&self.video_output_window),
@@ -725,6 +729,7 @@ impl<V: VideoSink, A: AudioSink> Clone for Player<V, A> {
 mod sync;
 use sync::*;
 
+mod font_cache;
 mod text;
 use text::*;
 
@@ -931,6 +936,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
             subtitle_representation: Arc::new(StdMutex::new(None)),
             subtitle_selection: Arc::new(AtomicU64::new(0)),
             subtitle_hold: Arc::new(SubtitleHold::default()),
+            font_cache_dir: Arc::new(StdMutex::new(None)),
             external_text: Arc::new(StdMutex::new(Vec::new())),
             next_external_id: Arc::new(AtomicU32::new(EXTERNAL_TEXT_ID_BASE)),
             video_output_window: Arc::new(DirectWindow::new()),
@@ -1876,6 +1882,24 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         self.video_renderer.set_subtitle_style(style.sanitised());
     }
 
+    /// Cache the subtitle fonts a manifest lists (DVB font download) in
+    /// `dir`, so the next track or episode that names the same font reads it
+    /// from disk instead of downloading it again. `None` turns the cache off
+    /// (the default). Applies from the next subtitle track selection.
+    ///
+    /// The player only adds files (`<sha256>.font`, keyed by the font URL
+    /// without its query string) and refreshes a file's modification time
+    /// when it uses it. Limiting the size is the host's job: delete the
+    /// oldest files by modification time, or the whole directory, at any
+    /// time — a missing font is simply downloaded again. Use a directory of
+    /// its own (Android: a folder under `Context.cacheDir`; iOS: under
+    /// `Caches`). Ignored on the web, where the browser's HTTP cache serves
+    /// the same purpose.
+    pub fn set_font_cache_dir(&self, dir: Option<std::path::PathBuf>) {
+        log::info!("[subs] font cache dir: {:?}", dir);
+        *self.font_cache_dir.lock().unwrap() = dir;
+    }
+
     /// Add a subtitle track from bytes the host supplies itself — the
     /// sidecar `.srt` / `.vtt` a desktop user picked next to the movie.
     ///
@@ -2014,6 +2038,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let active = Arc::clone(&self.subtitle_representation);
         let target = (Arc::clone(&self.subtitle_selection), selection);
         let position_ms = Arc::clone(&self.position_ms);
+        let font_cache_dir = self.font_cache_dir.lock().unwrap().clone();
         // A styled track (one script file + its fonts) holds playback until
         // it is in; segmented / host-supplied cues need no wait.
         let hold = representation.is_ass() && representation.external_cues.is_none();
@@ -2023,7 +2048,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
         let release = self.clone();
         let representation_id = representation.id;
         self.rt.spawn(async move {
-            let res = text_play(repr, stop_epoch, http, sink, active, target, position_ms).await;
+            let res = text_play(repr, stop_epoch, http, sink, active, target, position_ms, font_cache_dir).await;
             let mut why = "subtitles in";
             if let Err(e) = res {
                 match e.downcast_ref::<SubtitleLoadError>() {

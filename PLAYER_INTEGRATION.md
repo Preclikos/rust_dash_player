@@ -617,6 +617,20 @@ track again retries). A supplemental font that fails only falls back like
 any unknown font. The script's charset is detected like a sidecar's. ASS
 inside ISO BMFF segments has no standard carriage and is not read.
 
+**Font cache.** The fonts of a track download in parallel (four at a
+time). With a cache directory set, a font is read from disk when it is
+there and written there after a download, so the next episode that names
+the same font does not download it again: `Player::set_font_cache_dir(Some
+(dir))`, Android `RustPlayer.fontCacheDir = File(context.cacheDir,
+"subtitle-fonts")`, iOS `RustPlayer.fontCacheDirectory` (a folder under
+`Caches`); set it before `start`. Off by default; ignored on the web (the
+browser HTTP cache covers it). Files are `<sha256>.font`, keyed by the font
+URL without its query string and fragment (tokenised URLs still hit). The
+player only adds files and refreshes a file's modification time when it
+uses it; bounding the size is the host's job: delete the oldest files by
+modification time, or the whole folder, at any time. A missing or damaged
+file is simply downloaded again. Nothing stays in memory past the track.
+
 **Fonts.** Scripts name fonts by family; a face matches the libass way
 (family name, then the closest weight/slant, or full / PostScript name).
 Faces come from, in order: the script's `[Fonts]` section, fonts the host

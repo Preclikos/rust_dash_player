@@ -112,6 +112,22 @@ class RustPlayer(private val context: Context) {
      */
     var alignToVsync: Boolean = true
 
+    /**
+     * Directory where the subtitle fonts a manifest lists are cached, so the
+     * next episode naming the same font reads it from disk (null = no cache,
+     * the default). Use a folder of its own, e.g. `File(context.cacheDir,
+     * "subtitle-fonts")`. The player only adds files and refreshes their
+     * modification time on use; limiting the size is up to the app (delete
+     * the oldest files by `lastModified`, or the whole folder, at any time).
+     * Takes effect from the next subtitle track selection; set it before
+     * [start] so the first track uses it too.
+     */
+    var fontCacheDir: java.io.File? = null
+        set(value) {
+            field = value
+            if (handle != 0L) NativeBridge.nativeSetFontCacheDir(handle, value?.absolutePath)
+        }
+
     private var vsyncCallback: Choreographer.FrameCallback? = null
 
     private var handle: Long = 0L
@@ -170,6 +186,7 @@ class RustPlayer(private val context: Context) {
         )
         // 0 = no player (onError already queued, e.g. gpu_unsupported).
         if (handle == 0L) return
+        fontCacheDir?.let { NativeBridge.nativeSetFontCacheDir(handle, it.absolutePath) }
         if (reportDisplayTiming) {
             trackDisplayTiming()
             if (alignToVsync) startVsyncSampling()
