@@ -156,6 +156,7 @@ fn describe_event(ev: &crate::PlayerEvent) -> Option<String> {
         ),
         E::Prepared => "prepared".into(),
         E::Buffering { reason } => format!("buffering ({reason:?})"),
+        E::Ready { position } => format!("ready at {:.1} s", position.as_secs_f64()),
         E::Playing => "playing".into(),
         E::Paused => "paused".into(),
         E::TrackChanged { kind, info } => {

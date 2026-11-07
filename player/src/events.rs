@@ -26,6 +26,13 @@ pub enum PlayerEvent {
     /// Waiting for media data (initial fill, segment-boundary stall,
     /// post-seek, track switch).
     Buffering { reason: BufferingReason },
+    /// The pipeline is primed at `position`: the first frame at the target is
+    /// on screen and the audio pre-roll is queued, so `resume()` /
+    /// `resume_after()` starts output at once. Emitted once per pipeline
+    /// build (start, seek, track switch), also while paused, which is the
+    /// point: a seek while paused ends in `Ready` (no `Playing` follows until
+    /// resumed). Built for synchronised starts (watch party "ready barrier").
+    Ready { position: Duration },
     /// Playback active.
     Playing,
     /// Paused by the consumer via `pause()`.
@@ -121,6 +128,21 @@ pub enum PlayerEvent {
         kind: PlayerErrorKind,
         detail: String,
     },
+}
+
+/// Where the master clock is, read at the moment of the call: the AUDIBLE
+/// media position (audio-disciplined, output latency already accounted), not
+/// the PTS of the last rendered frame that `position()` reports. See
+/// `Player::clock_position`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockPosition {
+    /// Media position audible now.
+    pub position: Duration,
+    /// True while the timeline is moving (not paused, not buffering, the
+    /// audio output has started). When false, `position` stands still.
+    pub advancing: bool,
+    /// Rate media time advances at relative to real time (1.0 = normal).
+    pub rate: f64,
 }
 
 /// Categorised player error so consumers can branch programmatically

@@ -21,6 +21,8 @@ use super::*;
 pub(super) struct VideoAtTarget {
     reached: AtomicBool,
     notify: Notify,
+    /// `PlayerEvent::Ready` already sent for this pipeline.
+    ready_sent: AtomicBool,
 }
 
 impl VideoAtTarget {
@@ -29,7 +31,14 @@ impl VideoAtTarget {
     const MAX_WAIT: Duration = Duration::from_secs(2);
 
     pub(super) fn new() -> Self {
-        VideoAtTarget { reached: AtomicBool::new(false), notify: Notify::new() }
+        VideoAtTarget { reached: AtomicBool::new(false), notify: Notify::new(), ready_sent: AtomicBool::new(false) }
+    }
+
+    /// Send `PlayerEvent::Ready` once per pipeline.
+    fn emit_ready(&self, events: &crate::debug::EventBus, position: Duration) {
+        if !self.ready_sent.swap(true, Ordering::SeqCst) {
+            let _ = events.send(PlayerEvent::Ready { position });
+        }
     }
 
     fn signal(&self) {
@@ -50,6 +59,17 @@ impl VideoAtTarget {
             _ = crate::rt::sleep(Self::MAX_WAIT) => Some(false),
             _ = stop.notified() => None,
         }
+    }
+}
+
+/// A media-time span as the real time it takes at `rate`. Exactly the input
+/// at 1.0, so the pacing arithmetic is unchanged unless a rate is in force.
+#[inline]
+fn media_to_wall(media: i64, rate: f64) -> i64 {
+    if rate == 1.0 {
+        media
+    } else {
+        (media as f64 / rate) as i64
     }
 }
 
@@ -131,6 +151,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
     pause_notify: Arc<Notify>,
     stats: Arc<StatsState>,
     at_target: Arc<VideoAtTarget>,
+    rate_map: Arc<crate::time_stretch::RateMap>,
 ) {
     // While paused, real time keeps advancing but media time must NOT.
     // We accumulate the wall-clock duration spent paused and subtract
@@ -277,7 +298,11 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         seek_offset,
         paused.clone(),
         stats.clone(),
+        Arc::clone(&rate_map),
     );
+    // Previous clock reading, to tell a moving timeline from a frozen one
+    // for `Player::clock_position`.
+    let mut prev_clock_us: Option<i64> = None;
     log::info!(
         "[vsync gen {}] loop start (seek_offset={}ms origin={}ms)",
         gen,
@@ -430,7 +455,18 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // Master clock — audio-disciplined (already output-latency corrected
         // so it reads the media time currently AUDIBLE), wall fallback. See
         // MediaClock.
-        let elapsed = (clock.now_us(pause_skew) / 1_000) as u64;
+        let clock_us = clock.now_us(pause_skew);
+        let elapsed = (clock_us / 1_000) as u64;
+        // Rate the timeline runs at (1.0 unless the audio is being
+        // stretched): media spans become real-time waits through it.
+        let rate = rate_map.applied_rate();
+        *stats.clock_sample.lock().unwrap() = Some(super::ClockSample {
+            media_us: clock_us,
+            at: Instant::now(),
+            advancing: prev_clock_us.is_some_and(|p| clock_us > p),
+            rate,
+        });
+        prev_clock_us = Some(clock_us);
 
         // The frame's 0-based media time — the axis the clock counts in and
         // the audio was trimmed on. No first-frame anchoring: a frame is due
@@ -440,6 +476,12 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         if !logged_first_frame {
             logged_first_frame = true;
             at_target.signal();
+            // Passthrough has no pre-roll gate in the audio loop (the
+            // bitstream track primes itself): the picture at the target is
+            // what "primed" means there.
+            if audio_sink.is_passthrough() {
+                at_target.emit_ready(&events, Duration::from_millis(pts_ms));
+            }
             log::info!(
                 "[vsync gen {}] first frame pts={}ms target={}ms clock={}ms audio_since_flush={:?}ms {}ms after loop start",
                 gen,
@@ -574,7 +616,9 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
                 let target_wake_ms = pts_ms.saturating_sub(render_budget_ms);
                 if target_wake_ms > elapsed {
                     tokio::select! {
-                        _ = crate::rt::sleep(Duration::from_millis(target_wake_ms - elapsed)) => {}
+                        _ = crate::rt::sleep(Duration::from_millis(
+                            media_to_wall((target_wake_ms - elapsed) as i64, rate) as u64,
+                        )) => {}
                         _ = stop.notified() => break,
                     }
                     if stop_flag.load(Ordering::Relaxed) {
@@ -643,7 +687,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         if elapsed_us / 1_000 > pts_ms as i64 + LATE_FRAME_MS as i64 {
             stats.video_late_frames.fetch_add(1, Ordering::Relaxed);
         }
-        let pts_to_go_ns = (pts_us_rel - elapsed_us).max(0) * 1_000;
+        let pts_to_go_ns = media_to_wall((pts_us_rel - elapsed_us).max(0) * 1_000, rate);
         let raw_present_ns = clock_monotonic_ns() + pts_to_go_ns;
         // De-judder: `raw_present_ns` carries the audio master clock's
         // frame-to-frame wobble (it's a quantized per-callback staircase, wall-
@@ -666,7 +710,7 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
         // no lasting offset stick (~0.7 s time constant at 24 fps).
         let present_ns = match last_present {
             Some((last_ns, last_pts_us)) => {
-                let ideal_ns = last_ns + (pts_us_rel - last_pts_us) * 1_000;
+                let ideal_ns = last_ns + media_to_wall((pts_us_rel - last_pts_us) * 1_000, rate);
                 let pulled_ns = ideal_ns + (raw_present_ns - ideal_ns) / PRESENT_PULL;
                 pulled_ns.clamp(
                     raw_present_ns - PRESENT_SMOOTH_NS,
@@ -724,7 +768,8 @@ pub(super) async fn video_sync_loop<V: VideoSink, A: AudioSink>(
             }
             let direct = matches!(frame.native, crate::decoders::PlatformFrame::MediaCodecDirect(_));
             // This frame's duration from the media delta to the previous one.
-            let frame_ns = last_present.map_or(0, |(_, last_pts_us)| (pts_us_rel - last_pts_us) * 1_000);
+            let frame_ns = last_present
+                .map_or(0, |(_, last_pts_us)| media_to_wall((pts_us_rel - last_pts_us) * 1_000, rate));
             let grid = stats
                 .present_lead
                 .vsync_grid()
@@ -1106,6 +1151,7 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
     events: Arc<crate::debug::EventBus>,
     paused: Arc<AtomicBool>,
     at_target: Arc<VideoAtTarget>,
+    rate_map: Arc<crate::time_stretch::RateMap>,
 ) {
     // Keep the PCM handed to the sink continuous on the media axis (see
     // `crate::av_sync::AudioAligner`):
@@ -1127,6 +1173,14 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
     // Output starts once PREROLL_MS of PCM is queued (or the source goes
     // quiet first) — never against an empty queue.
     let mut preroll = crate::av_sync::PrerollGate::new(sample_rate, sink.is_passthrough());
+    // Playback rate: frames handed to the stretcher / to the sink so far,
+    // and the stretcher once a rate other than 1.0 was asked for. Until
+    // then the PCM goes to the sink untouched (the original path).
+    let mut in_frames: u64 = 0;
+    let mut out_frames: u64 = 0;
+    let mut stretch: Option<crate::time_stretch::TimeStretch> = None;
+    let mut stretched: Vec<f32> = Vec::new();
+    let ready_at = Duration::from_millis(target_pts_ms.max(0) as u64);
     loop {
         if stop_flag.load(Ordering::Relaxed) {
             break;
@@ -1164,10 +1218,13 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
                     break f;
                 }
                 _ = &mut starvation_wait => {
-                    if preroll.force_open() && !paused.load(Ordering::Relaxed) {
+                    if preroll.force_open() {
                         // A trickle that never filled the pre-roll: play
                         // what there is rather than hold the start.
-                        sink.set_paused(false);
+                        at_target.emit_ready(&events, ready_at);
+                        if !paused.load(Ordering::Relaxed) {
+                            sink.set_paused(false);
+                        }
                     }
                     if !starving {
                         starving = true;
@@ -1231,13 +1288,36 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
         if trimmed.is_empty() {
             continue;
         }
+        let rate = stats.playback_rate.get();
+        if stretch.is_none() && rate != 1.0 && !sink.is_passthrough() {
+            log::info!("[async] playback rate {rate:.3}: time stretch engaged");
+            stretch = Some(crate::time_stretch::TimeStretch::new(
+                sample_rate,
+                channels,
+                in_frames,
+                out_frames,
+            ));
+        }
+        in_frames += (trimmed.len() / channels) as u64;
+        let pcm: &[f32] = match stretch.as_mut() {
+            None => &trimmed,
+            Some(ts) => {
+                stretched.clear();
+                ts.process(&trimmed, rate, &mut stretched, &rate_map);
+                &stretched
+            }
+        };
+        if pcm.is_empty() {
+            continue;
+        }
+        out_frames += (pcm.len() / channels) as u64;
         tokio::select! {
-            _ = sink.put_samples(&trimmed) => {
+            _ = sink.put_samples(pcm) => {
                 stats.diag_audio_sunk.fetch_add(1, Ordering::Relaxed);
             }
             _ = stop.notified() => return,
         }
-        if preroll.queued(trimmed.len() / channels) {
+        if preroll.queued(pcm.len() / channels) {
             log::debug!(
                 "[async] audio pre-roll of {} ms queued — output starts",
                 crate::av_sync::PrerollGate::PREROLL_MS
@@ -1255,6 +1335,8 @@ pub(super) async fn audio_sync_loop<A: AudioSink>(
                     waited.elapsed().as_millis()
                 ),
             }
+            // Picture at the target + audio queued: a resume starts at once.
+            at_target.emit_ready(&events, ready_at);
             if !paused.load(Ordering::Relaxed) {
                 sink.set_paused(false);
             }
@@ -1457,6 +1539,9 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
     let at_target = Arc::new(VideoAtTarget::new());
     let paused_audio = Arc::clone(&paused);
     let end_position = Arc::clone(&position_ms);
+    // Output -> media time map for this pipeline (identity unless a playback
+    // rate other than 1.0 engages the stretcher).
+    let rate_map = Arc::new(crate::time_stretch::RateMap::new(audio_sink.sample_rate()));
     let (_, _) = tokio::join!(
         crate::rt::spawn(video_sync_loop(
             gen,
@@ -1476,6 +1561,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             pause_notify,
             stats,
             Arc::clone(&at_target),
+            Arc::clone(&rate_map),
         )),
         crate::rt::spawn(audio_sync_loop(
             audio_rx,
@@ -1488,6 +1574,7 @@ pub(super) async fn av_sync_handler<V: VideoSink, A: AudioSink>(
             events_audio,
             paused_audio,
             at_target,
+            rate_map,
         )),
     );
     // Both loops returning naturally (channels closed by decoder EOF) means

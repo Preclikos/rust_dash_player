@@ -30,6 +30,7 @@ pub mod shader_src;
 // Wrapped ClearKey licences (docs/CLEARKEY_WRAPPED_LICENCE.md).
 pub mod wrapped_licence;
 mod subtitle_style;
+mod time_stretch;
 mod tracks;
 mod utils;
 
@@ -47,11 +48,12 @@ pub use macos_host::{macos_display_hdr_types, macos_install_direct_video_layer};
 /// consumer reads them via inference (no need to name the inner types).
 pub use manifest::ManifestPrefetch;
 pub use tracks::Tracks;
+pub use time_stretch::{MAX_RATE as MAX_PLAYBACK_RATE, MIN_RATE as MIN_PLAYBACK_RATE};
 pub use debug::{
     DebugAbr, DebugAudio, DebugLogEntry, DebugNetwork, DebugPipeline, DebugSession, DebugSnapshot, DebugSync, DebugVideo,
 };
 pub use events::{
-    BufferingReason, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
+    BufferingReason, ClockPosition, Fps, PlayerErrorKind, PlayerEvent, TrackInfo, TrackKind,
 };
 pub use ffmpeg_log::{set_log_level, LogLevel};
 pub use hdr_tonemap::HdrTonemapParams;

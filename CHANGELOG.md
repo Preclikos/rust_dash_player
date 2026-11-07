@@ -3,6 +3,33 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.2
+
+### All platforms
+
+- **Playback rate.** `Player::set_playback_rate(f64)` (0.5–2.0,
+  `MIN_PLAYBACK_RATE` / `MAX_PLAYBACK_RATE`) with pitch-preserving time
+  stretch (WSOLA); the picture follows the audio-mastered clock. Built for
+  small continuous corrections (watch-party drift), works across the range.
+  Refused (`false`) while audio goes out as a bitstream (passthrough). At
+  1.0 the audio and pacing paths are the unchanged originals; the stretcher
+  only runs once another rate is set. Not yet tuned for the Apple direct
+  (HDR layer) output, where a non-1.0 rate re-anchors the layer timebase
+  every few frames.
+- **`PlayerEvent::Ready { position }`**: the pipeline is primed at
+  `position` (first frame at the target on screen, audio pre-roll queued),
+  emitted once per pipeline build, also while paused (a paused seek ends in
+  `Ready`). Bridge JSON: `{"type":"ready","position_ms":…}`. Hosts that
+  match `PlayerEvent` exhaustively need an arm for it.
+- **`Player::clock_position()`** → `ClockPosition { position, advancing,
+  rate }`: the media position audible now (master clock), finer than
+  `position()` (last rendered frame).
+- **`Player::resume_after(delay)`**: resume so the current position becomes
+  audible `delay` from now (output latency taken off); cancelled by any
+  pause / resume / seek. For synchronised starts across devices.
+- Conformance harness: `--rate <r>` and `--mute` (the beep tap reads the PCM
+  before the volume stage).
+
 ## 0.3.1
 
 ### All platforms

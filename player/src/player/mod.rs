@@ -324,6 +324,16 @@ pub(crate) struct StatsState {
     /// IT hasn't received a frame for >300 ms. Video parks on its
     /// current frame instead of marching forward over silence.
     audio_starving: AtomicBool,
+    /// Playback rate the host asked for (`Player::set_playback_rate`); 1.0
+    /// by default. The audio loop applies it, see `crate::time_stretch`.
+    pub(crate) playback_rate: crate::time_stretch::RateControl,
+    /// Latest master-clock reading taken by the video sync loop, for
+    /// `Player::clock_position`. Cleared on seek (it belongs to the old
+    /// pipeline).
+    pub(crate) clock_sample: StdMutex<Option<ClockSample>>,
+    /// Bumped by every pause / resume / seek: a pending `resume_after`
+    /// only fires if nothing else touched the timeline since it was set.
+    pub(crate) resume_gen: AtomicU64,
     /// Pipeline rebuilds spent trying to bring a dead audio output back.
     /// Lives on the per-Player stats (not the per-generation locals) so the
     /// budget survives the very rebuild it is counting.
@@ -440,6 +450,25 @@ enum SurfacePlane {
     #[cfg_attr(not(target_os = "android"), allow(dead_code))]
     Overlay,
 }
+
+/// One master-clock reading (see `StatsState::clock_sample`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClockSample {
+    /// 0-based media µs the clock read.
+    pub(crate) media_us: i64,
+    /// When it was read.
+    pub(crate) at: Instant,
+    /// The clock moved since the previous reading (false while frozen:
+    /// start-up before audio is audible, right after a resume).
+    pub(crate) advancing: bool,
+    /// Rate the timeline advances at (the stretcher's applied rate).
+    pub(crate) rate: f64,
+}
+
+/// How far `clock_position` extrapolates past the last clock reading. The
+/// video loop reads the clock every frame (≈ 42 ms at 24 fps), so anything
+/// older means it is parked and the timeline is not moving anyway.
+const CLOCK_EXTRAPOLATE_MAX: Duration = Duration::from_millis(250);
 
 /// Playback held because the host's surfaces are gone (Android: Home or
 /// another app on top destroys the SurfaceViews while the host keeps the
@@ -1253,6 +1282,7 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// audio output stops feeding the device. PTS does not advance.
     /// `Paused` event is emitted; no-op if already paused.
     pub fn pause(&self) {
+        self.stats.resume_gen.fetch_add(1, Ordering::SeqCst);
         // the host's pause outlives a subtitle hold
         self.subtitle_hold.held.store(false, Ordering::SeqCst);
         if !self.paused.swap(true, Ordering::Relaxed) {
@@ -1265,9 +1295,93 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// audio output. `Playing` is emitted by the first rendered frame
     /// after resume. No-op if not paused.
     pub fn resume(&self) {
+        self.stats.resume_gen.fetch_add(1, Ordering::SeqCst);
         if self.paused.swap(false, Ordering::Relaxed) {
             self.audio_renderer.set_paused(false);
             self.pause_notify.notify_waiters();
+        }
+    }
+
+    /// Resume so that the media at the current (paused) position becomes
+    /// AUDIBLE `delay` from now: the audio output latency is taken off the
+    /// wait, so several devices given the same target instant start in step.
+    /// Meant for a primed pipeline (after `PlayerEvent::Ready`); before that
+    /// the start additionally waits for the pipeline as usual.
+    ///
+    /// Cancelled by any `pause()`, `resume()`, `seek()` or a newer
+    /// `resume_after()` in the meantime. A `delay` shorter than the output
+    /// latency resumes at once.
+    pub fn resume_after(&self, delay: Duration) {
+        let gen = self.stats.resume_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let latency = Duration::from_millis(self.audio_renderer.output_latency_ms());
+        let wait = delay.saturating_sub(latency);
+        let stats = Arc::clone(&self.stats);
+        let paused = Arc::clone(&self.paused);
+        let sink = Arc::clone(&self.audio_renderer);
+        let notify = Arc::clone(&self.pause_notify);
+        self.rt.spawn(async move {
+            if !wait.is_zero() {
+                crate::rt::sleep(wait).await;
+            }
+            if stats.resume_gen.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if paused.swap(false, Ordering::Relaxed) {
+                sink.set_paused(false);
+                notify.notify_waiters();
+            }
+        });
+    }
+
+    /// Set the playback rate (1.0 = normal), clamped to
+    /// [`crate::MIN_PLAYBACK_RATE`]..=[`crate::MAX_PLAYBACK_RATE`]. Pitch is
+    /// preserved (WSOLA time stretch); video follows the audio clock.
+    ///
+    /// Takes effect within a few tens of ms on the running pipeline and
+    /// persists across seeks / track switches. Returns `false` (and leaves
+    /// the rate at 1.0) when the audio goes out as a bitstream (passthrough
+    /// cannot be stretched). At exactly 1.0 the audio path is the untouched
+    /// original one; the stretcher only runs once a different rate is set.
+    pub fn set_playback_rate(&self, rate: f64) -> bool {
+        if self.audio_renderer.is_passthrough() && rate != 1.0 {
+            self.stats.playback_rate.set(1.0);
+            return false;
+        }
+        self.stats.playback_rate.set(rate);
+        true
+    }
+
+    /// The rate last set with `set_playback_rate` (after clamping).
+    pub fn playback_rate(&self) -> f64 {
+        self.stats.playback_rate.get()
+    }
+
+    /// The master clock now: the media position AUDIBLE at the moment of
+    /// the call, extrapolated from the video loop's latest clock reading.
+    /// Finer and more current than `position()` (the PTS of the last
+    /// rendered frame); use it to compare positions across devices.
+    pub fn clock_position(&self) -> crate::ClockPosition {
+        let sample = *self.stats.clock_sample.lock().unwrap();
+        let Some(s) = sample else {
+            return crate::ClockPosition {
+                position: self.position(),
+                advancing: false,
+                rate: self.stats.playback_rate.get(),
+            };
+        };
+        let advancing = s.advancing
+            && !self.paused.load(Ordering::Relaxed)
+            && !self.stats.audio_starving.load(Ordering::Relaxed)
+            && !self.stats.video_starving.load(Ordering::Relaxed);
+        let mut us = s.media_us;
+        if advancing {
+            let since = s.at.elapsed().min(CLOCK_EXTRAPOLATE_MAX);
+            us += (since.as_micros() as f64 * s.rate) as i64;
+        }
+        crate::ClockPosition {
+            position: Duration::from_micros(us.max(0) as u64),
+            advancing,
+            rate: s.rate,
         }
     }
 
@@ -2978,6 +3092,8 @@ impl<V: VideoSink, A: AudioSink> Player<V, A> {
     /// already named a more specific cause (a track switch is a seek only
     /// mechanically; the consumer must not be told the user scrubbed).
     fn seek_internal(&self, target: Duration) {
+        self.stats.resume_gen.fetch_add(1, Ordering::SeqCst);
+        *self.stats.clock_sample.lock().unwrap() = None;
         let seek_target = self.seek_target.clone();
         let stop = self.stop.clone();
         let stop_flag = self.stop_flag.clone();

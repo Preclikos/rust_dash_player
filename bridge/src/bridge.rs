@@ -652,7 +652,7 @@ fn spawn_event_pump(
 
 /// Serialize one [`PlayerEvent`] to the unified event JSON. Schema:
 /// `{"type": "...", <fields>}` where `type` is one of `idle`,
-/// `manifest_loaded`, `prepared`, `buffering`, `playing`, `paused`,
+/// `manifest_loaded`, `prepared`, `buffering`, `ready`, `playing`, `paused`,
 /// `position`, `track_changed`, `glitch_recovered`, `subtitle_track_failed`,
 /// `stats`, `end_of_stream`, `error`. (The pump additionally synthesizes a `video_size` event —
 /// `{"type":"video_size","width","height"}` — when the rendered resolution
@@ -676,6 +676,10 @@ pub fn event_to_json(ev: &PlayerEvent) -> String {
         PlayerEvent::Buffering { reason } => format!(
             r#"{{"type":"buffering","reason":{}}}"#,
             jstr(buffering_reason(reason))
+        ),
+        PlayerEvent::Ready { position } => format!(
+            r#"{{"type":"ready","position_ms":{}}}"#,
+            position.as_millis()
         ),
         PlayerEvent::Playing => obj("playing"),
         PlayerEvent::Paused => obj("paused"),

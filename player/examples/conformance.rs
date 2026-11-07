@@ -76,6 +76,8 @@ struct Args {
     allowed_stalls: Option<u64>,
     hud: bool,
     buffer_secs: Option<u32>,
+    rate: f64,
+    mute: bool,
 }
 
 fn parse_args() -> Args {
@@ -96,6 +98,8 @@ fn parse_args() -> Args {
         allowed_stalls: None,
         hud: false,
         buffer_secs: None,
+        rate: 1.0,
+        mute: false,
     };
     while let Some(arg) = it.next() {
         let mut val = |name: &str| it.next().unwrap_or_else(|| panic!("{name} needs a value"));
@@ -107,6 +111,8 @@ fn parse_args() -> Args {
             }
             "--secs" => a.secs = val("--secs").parse().expect("--secs"),
             "--hud" => a.hud = true,
+            "--mute" => a.mute = true,
+            "--rate" => a.rate = val("--rate").parse().expect("--rate"),
             "--buffer-secs" => a.buffer_secs = Some(val("--buffer-secs").parse().expect("--buffer-secs")),
             "--switches" => a.switches = val("--switches").parse().expect("--switches"),
             "--seeks" => a.seeks = val("--seeks").parse().expect("--seeks"),
@@ -615,6 +621,9 @@ async fn main() {
                                 .get_or_insert_with(|| detail.clone());
                             eprintln!("[conformance] EVENT Error({kind:?}): {detail}");
                         }
+                        PlayerEvent::Ready { position } => {
+                            eprintln!("[conformance] EVENT Ready at {} ms", position.as_millis());
+                        }
                         PlayerEvent::EndOfStream => {
                             counters.eos.fetch_add(1, Ordering::Relaxed);
                             eprintln!("[conformance] EVENT EndOfStream");
@@ -631,6 +640,15 @@ async fn main() {
         });
     }
 
+    if args.mute {
+        // The beep tap reads the PCM before the volume stage: muting keeps
+        // every measurement and spares whoever sits next to the speakers.
+        player.set_volume(0.0);
+    }
+    if args.rate != 1.0 {
+        assert!(player.set_playback_rate(args.rate), "playback rate refused");
+        eprintln!("[conformance] playback rate {}", player.playback_rate());
+    }
     let handle = player.play().expect("play");
 
     // ---- scripted scenario ---------------------------------------------------

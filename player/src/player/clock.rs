@@ -100,6 +100,9 @@ pub(crate) struct MediaClock<A: AudioSink> {
     // Audio starvation (no decoded frame for 300 ms) pauses the sink itself
     // — again a standing position on purpose. Read from the shared stats.
     stats: Arc<StatsState>,
+    // Output time -> media time once a playback rate other than 1.0 has
+    // stretched this pipeline's audio (identity until then).
+    rate_map: Arc<crate::time_stretch::RateMap>,
 }
 
 /// How long the sink's position may stand still, while playback is neither
@@ -192,6 +195,7 @@ impl<A: AudioSink> MediaClock<A> {
         seek_offset: Duration,
         paused: Arc<AtomicBool>,
         stats: Arc<StatsState>,
+        rate_map: Arc<crate::time_stretch::RateMap>,
     ) -> Self {
         Self {
             audio_sink,
@@ -200,7 +204,15 @@ impl<A: AudioSink> MediaClock<A> {
             state: std::sync::Mutex::new(ClockState::default()),
             paused,
             stats,
+            rate_map,
         }
+    }
+
+    /// Output-domain µs (audio played since the flush, minus the output
+    /// latency) -> 0-based media µs. With the map not engaged this is
+    /// `(out_us + seek_offset_us).max(0)`, the formula the clock always used.
+    fn out_to_media_us(&self, out_us: i64) -> i64 {
+        (self.rate_map.media_us(out_us) + self.seek_offset_us).max(0)
     }
 
     /// Audio-disciplined position (µs), or None when the sink reports no clock.
@@ -212,8 +224,7 @@ impl<A: AudioSink> MediaClock<A> {
         let played = self.audio_sink.played_since_flush_ms()?;
         let lat_us = self.audio_sink.output_latency_ms() as i64 * 1_000;
         let now = Instant::now();
-        let to_media_us =
-            |ms: i64| -> i64 { (ms * 1_000 + self.seek_offset_us - lat_us).max(0) };
+        let to_media_us = |ms: i64| -> i64 { self.out_to_media_us(ms * 1_000 - lat_us) };
         let mut st = self.state.lock().unwrap();
         let held = self.paused.load(Ordering::Relaxed)
             || self.stats.audio_starving.load(Ordering::Relaxed)
@@ -314,7 +325,7 @@ impl<A: AudioSink> MediaClock<A> {
         } else {
             p0 as i64 * 1_000
         };
-        Some((pos_us + self.seek_offset_us - lat_us).max(0))
+        Some(self.out_to_media_us(pos_us - lat_us))
     }
 
     /// Current 0-based media time (µs): audio when available, else the wall
@@ -362,6 +373,7 @@ mod tests {
             Duration::ZERO,
             paused.clone(),
             stats.clone(),
+            Arc::new(crate::time_stretch::RateMap::new(48_000)),
         );
         ClockFixture { clock, sink, paused, stats }
     }
