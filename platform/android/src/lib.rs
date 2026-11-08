@@ -21,7 +21,7 @@ use bridge::{
 use async_trait::async_trait;
 use jni::objects::{JByteArray, JClass, JObject, JObjectArray, JString, JValue};
 use jni::refs::Global;
-use jni::sys::{jboolean, jfloat, jint, jlong, jstring};
+use jni::sys::{jboolean, jdouble, jfloat, jint, jlong, jstring};
 use jni::{jni_sig, jni_str, Env, EnvUnowned, JavaVM, Outcome};
 use player::{Player, SubtitleStyle};
 
@@ -285,11 +285,15 @@ unsafe fn handle_ref<'a>(handle: jlong) -> Option<&'a Handle> {
 }
 
 /// `nativeStart(Context, provider, overlaySurface, videoSurface, w, h, hdrTypes,
-/// manifestUrl, startFraction, audioPassthrough, autoSelectSubtitle) -> long`.
+/// manifestUrl, startFraction, audioPassthrough, autoSelectSubtitle,
+/// preferredAudioLang, preferredSubtitleLang, startPositionMs, startPaused) -> long`.
 ///
 /// Builds a player rendering into the surfaces, wires the generic provider, and
-/// starts `manifestUrl`. `startFraction` < 0 = no resume; `audioPassthrough`
-/// -1 = library default, 0/1 = off/on. Returns an opaque handle or 0.
+/// starts `manifestUrl`. `startFraction` < 0 = no resume; `startPositionMs`
+/// >= 0 starts at that position instead (wins over `startFraction`);
+/// `startPaused` primes the pipeline (first frame, `ready` event) and waits
+/// for `play` / `resumeAfter`; `audioPassthrough` -1 = library default,
+/// 0/1 = off/on. Returns an opaque handle or 0.
 #[no_mangle]
 pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeStart<'local>(
     mut env: EnvUnowned<'local>,
@@ -307,6 +311,8 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSt
     auto_select_subtitle: jboolean,
     preferred_audio_lang: JString<'local>,
     preferred_subtitle_lang: JString<'local>,
+    start_position_ms: jlong,
+    start_paused: jboolean,
 ) -> jlong {
     with_env_or("nativeStart", &mut env, 0, move |env| {
         init_logging();
@@ -429,8 +435,15 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSt
             player.set_video_output_window(video_window as *mut c_void);
         }
 
+        // A watch party starts paused at the room's position and resumes in
+        // step with the room (`resumeAfter`).
+        if start_paused {
+            player.pause();
+        }
+
         let config = StartConfig {
-            start_position: None,
+            start_position: (start_position_ms >= 0)
+                .then(|| std::time::Duration::from_millis(start_position_ms as u64)),
             start_fraction: if start_fraction >= 0.0 {
                 Some(start_fraction)
             } else {
@@ -570,6 +583,73 @@ pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSe
         if let Some(h) = unsafe { handle_ref(handle) } {
             let _guard = runtime().enter();
             h.bridge.set_volume(volume);
+        }
+    })
+}
+
+/// Playback rate (1.0 = normal, clamped to 0.5..=2.0, pitch kept); see
+/// `Player::set_playback_rate`. `false` when it cannot be applied (audio out
+/// as a bitstream).
+#[no_mangle]
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeSetPlaybackRate(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    rate: jdouble,
+) -> jboolean {
+    ffi_guard("nativeSetPlaybackRate", false, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| {
+                let _guard = runtime().enter();
+                h.bridge.player().set_playback_rate(rate)
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The media position audible now (`Player::clock_position`) as
+/// `{"position_ms":…,"advancing":…,"rate":…}`; finer than `nativePositionMs`
+/// (last rendered frame).
+#[no_mangle]
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeClockPositionJson<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    handle: jlong,
+) -> jstring {
+    with_env_or("nativeClockPositionJson", &mut env, std::ptr::null_mut(), move |env| {
+        let json = unsafe { handle_ref(handle) }
+            .map(|h| {
+                let c = h.bridge.player().clock_position();
+                format!(
+                    r#"{{"position_ms":{},"advancing":{},"rate":{}}}"#,
+                    c.position.as_millis(),
+                    c.advancing,
+                    c.rate
+                )
+            })
+            .unwrap_or_else(|| "{}".to_string());
+        match env.new_string(json) {
+            Ok(s) => s.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    })
+}
+
+/// Resume so the current position becomes audible `delayMs` from now
+/// (`Player::resume_after`); cancelled by any pause / resume / seek.
+#[no_mangle]
+pub extern "system" fn Java_io_github_preclikos_rustplayer_NativeBridge_nativeResumeAfter(
+    _env: EnvUnowned,
+    _class: JClass,
+    handle: jlong,
+    delay_ms: jlong,
+) {
+    ffi_guard("nativeResumeAfter", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge
+                .player()
+                .resume_after(std::time::Duration::from_millis(delay_ms.max(0) as u64));
         }
     })
 }

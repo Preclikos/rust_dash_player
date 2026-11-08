@@ -17,6 +17,12 @@ import org.json.JSONObject
  */
 class RustPlayer(private val context: Context) {
 
+    companion object {
+        /** [setPlaybackRate] bounds (the engine clamps to these). */
+        const val MIN_PLAYBACK_RATE = 0.5
+        const val MAX_PLAYBACK_RATE = 2.0
+    }
+
     /** Player events, delivered on the main thread. All methods are optional. */
     interface Listener {
         fun onPrepared() {}
@@ -92,7 +98,24 @@ class RustPlayer(private val context: Context) {
          * harness does). Not needed for normal playback.
          */
         fun onRawEvent(json: String) {}
+
+        /**
+         * The pipeline is primed at [positionMs]: first frame at the target on
+         * screen, audio pre-roll queued. Once per pipeline build, also while
+         * paused (a paused seek ends here, no [onPlaying] follows) — the
+         * moment a [resumeAfter] can start playback exactly on time.
+         */
+        fun onReady(positionMs: Long) {}
     }
+
+    /** [clockPosition]: the media position audible now. */
+    data class ClockPosition(
+        val positionMs: Long,
+        /** False while paused, buffering or before the first frame. */
+        val advancing: Boolean,
+        /** The playback rate in effect. */
+        val rate: Double,
+    )
 
     var listener: Listener? = null
 
@@ -167,6 +190,8 @@ class RustPlayer(private val context: Context) {
         autoSelectSubtitle: Boolean = true,
         preferredAudioLang: String? = null,
         preferredSubtitleLang: String? = null,
+        startPositionMs: Long? = null,
+        startPaused: Boolean = false,
     ) {
         if (handle != 0L) return
         val b = PlayerBridge(provider) { json -> main.post { dispatch(json) } }
@@ -183,6 +208,8 @@ class RustPlayer(private val context: Context) {
             autoSelectSubtitle,
             preferredAudioLang,
             preferredSubtitleLang,
+            startPositionMs ?: -1L,
+            startPaused,
         )
         // 0 = no player (onError already queued, e.g. gpu_unsupported).
         if (handle == 0L) return
@@ -304,6 +331,40 @@ class RustPlayer(private val context: Context) {
 
     val positionMs: Long get() = if (handle != 0L) NativeBridge.nativePositionMs(handle) else 0L
     val durationMs: Long get() = if (handle != 0L) NativeBridge.nativeDurationMs(handle) else 0L
+
+    /**
+     * Playback rate, 1.0 = normal, clamped to [MIN_PLAYBACK_RATE]..[MAX_PLAYBACK_RATE]
+     * with the pitch kept. Persists across seeks and track switches. Built for
+     * small continuous corrections (watch-party drift). Returns false when the
+     * rate cannot be applied — audio going out as a bitstream (passthrough).
+     */
+    fun setPlaybackRate(rate: Double): Boolean =
+        handle != 0L && NativeBridge.nativeSetPlaybackRate(handle, rate)
+
+    /**
+     * The media position audible now (the master clock) — finer than
+     * [positionMs], which is the last rendered frame. Null without a player.
+     */
+    fun clockPosition(): ClockPosition? {
+        if (handle == 0L) return null
+        val o = try {
+            JSONObject(NativeBridge.nativeClockPositionJson(handle))
+        } catch (e: Exception) {
+            return null
+        }
+        if (!o.has("position_ms")) return null
+        return ClockPosition(o.optLong("position_ms"), o.optBoolean("advancing"), o.optDouble("rate", 1.0))
+    }
+
+    /**
+     * Resume so the current position becomes audible [delayMs] from now (the
+     * output latency taken off) — for starting in step across devices. Meant
+     * for a primed pipeline (after [Listener.onReady]); any pause, resume or
+     * seek cancels it.
+     */
+    fun resumeAfter(delayMs: Long) {
+        if (handle != 0L) NativeBridge.nativeResumeAfter(handle, delayMs)
+    }
 
     fun setVolume(volume: Float) {
         if (handle != 0L) NativeBridge.nativeSetVolume(handle, volume)
@@ -467,6 +528,7 @@ class RustPlayer(private val context: Context) {
         when (o.optString("type")) {
             "prepared" -> l.onPrepared()
             "tracks_ready" -> l.onTracks(tracksJson())
+            "ready" -> l.onReady(o.optLong("position_ms"))
             "playing" -> l.onPlaying()
             "paused" -> l.onPaused()
             "buffering" -> l.onBuffering(o.optString("reason", "stall"))

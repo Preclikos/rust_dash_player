@@ -29,6 +29,8 @@ object NativeBridge {
         autoSelectSubtitle: Boolean,
         preferredAudioLang: String?,    // BCP-47, null = codec default
         preferredSubtitleLang: String?, // BCP-47, null = auto-select policy
+        startPositionMs: Long,          // < 0 = none (startFraction applies)
+        startPaused: Boolean,           // prime (first frame, "ready") and wait
     ): Long
 
     external fun nativeSetSize(handle: Long, width: Int, height: Int)
@@ -38,6 +40,9 @@ object NativeBridge {
     external fun nativeSeekMs(handle: Long, positionMs: Long)
     external fun nativePositionMs(handle: Long): Long
     external fun nativeDurationMs(handle: Long): Long
+    external fun nativeSetPlaybackRate(handle: Long, rate: Double): Boolean
+    external fun nativeClockPositionJson(handle: Long): String
+    external fun nativeResumeAfter(handle: Long, delayMs: Long)
     external fun nativeSetVolume(handle: Long, volume: Float)
     external fun nativeGetTracksJson(handle: Long): String
     external fun nativeDebugJson(handle: Long): String
