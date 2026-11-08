@@ -3,18 +3,7 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
-## 0.3.4
-
-### Android
-
-- **Watch-party surface on the AAR** (the 0.3.2 `Player` API, as the web
-  package got in 0.3.3). `RustPlayer.setPlaybackRate(rate): Boolean`
-  (false while audio goes out as a bitstream), `clockPosition()` →
-  `ClockPosition(positionMs, advancing, rate)`, `resumeAfter(delayMs)`,
-  `Listener.onReady(positionMs)`, and two trailing `start` parameters:
-  `startPositionMs` (exact start, wins over `startFraction`) and
-  `startPaused` (prime the pipeline, then wait for `play()` /
-  `resumeAfter()`). Defaults keep existing callers unchanged.
+## 0.3.5
 
 ### iOS
 
@@ -29,6 +18,19 @@ pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
   `rustplayer_player_set_playback_rate`, `rustplayer_player_clock_position`
   (out pointers) and `rustplayer_player_resume_after`. A non-1.0 rate is
   still not tuned for the direct (HDR layer) output.
+
+## 0.3.4
+
+### Android
+
+- **Watch-party surface on the AAR** (the 0.3.2 `Player` API, as the web
+  package got in 0.3.3). `RustPlayer.setPlaybackRate(rate): Boolean`
+  (false while audio goes out as a bitstream), `clockPosition()` →
+  `ClockPosition(positionMs, advancing, rate)`, `resumeAfter(delayMs)`,
+  `Listener.onReady(positionMs)`, and two trailing `start` parameters:
+  `startPositionMs` (exact start, wins over `startFraction`) and
+  `startPaused` (prime the pipeline, then wait for `play()` /
+  `resumeAfter()`). Defaults keep existing callers unchanged.
 
 ## 0.3.3
 
