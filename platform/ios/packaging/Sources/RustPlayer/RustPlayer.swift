@@ -56,6 +56,10 @@ public protocol RustPlayerDelegate: AnyObject {
     func rustPlayerDidStartPlaying(_ player: RustPlayer)
     func rustPlayerDidPause(_ player: RustPlayer)
     func rustPlayerDidBuffer(_ player: RustPlayer)
+    /// The pipeline is primed at `positionMs`: first frame at the target on
+    /// screen, audio pre-roll queued. Once per pipeline build, also while
+    /// paused (a paused seek, or a `startPaused` start, ends here).
+    func rustPlayer(_ player: RustPlayer, readyAt positionMs: Int64)
     func rustPlayer(_ player: RustPlayer, position positionMs: Int64, duration durationMs: Int64)
     func rustPlayer(_ player: RustPlayer, videoSize size: CGSize)
     func rustPlayerDidEnd(_ player: RustPlayer)
@@ -71,6 +75,7 @@ public extension RustPlayerDelegate {
     func rustPlayerDidStartPlaying(_ player: RustPlayer) {}
     func rustPlayerDidPause(_ player: RustPlayer) {}
     func rustPlayerDidBuffer(_ player: RustPlayer) {}
+    func rustPlayer(_ player: RustPlayer, readyAt positionMs: Int64) {}
     func rustPlayer(_ player: RustPlayer, position positionMs: Int64, duration durationMs: Int64) {}
     func rustPlayer(_ player: RustPlayer, videoSize size: CGSize) {}
     func rustPlayerDidEnd(_ player: RustPlayer) {}
@@ -101,13 +106,18 @@ public final class RustPlayer {
 
     /// Build the player on `layer` and play `manifestURL`. The `provider`
     /// resolves auth/CDN/DRM (all app-side). `startFraction` resumes at 0..1 of
-    /// duration; `audioPassthrough` nil = library default; `autoSelectSubtitle`
+    /// duration; `startPositionMs` starts at that position instead (wins over
+    /// `startFraction`); `startPaused` primes the pipeline (first frame,
+    /// `readyAt`) and waits for `play()` / `resumeAfter(ms:)` — a watch-party
+    /// start. `audioPassthrough` nil = library default; `autoSelectSubtitle`
     /// default-on.
     public func start(
         layer: CAMetalLayer,
         manifestURL: String,
         provider: RustPlayerProvider,
         startFraction: Float? = nil,
+        startPositionMs: Int64? = nil,
+        startPaused: Bool = false,
         audioPassthrough: Bool? = nil,
         autoSelectSubtitle: Bool = true
     ) {
@@ -122,12 +132,13 @@ public final class RustPlayer {
         installVideoLayer(under: layer)
         let videoPtr = videoLayer.map { Unmanaged.passUnretained($0).toOpaque() }
         handle = manifestURL.withCString { urlPtr in
-            rustplayer_player_create_ex(
+            rustplayer_player_create_ex2(
                 Unmanaged.passUnretained(layer).toOpaque(),
                 videoPtr,
                 hdrMask(),
                 max(w, 1), max(h, 1),
-                urlPtr, startFraction ?? -1, ap, autoSelectSubtitle,
+                urlPtr, startFraction ?? -1, startPositionMs ?? -1, startPaused,
+                ap, autoSelectSubtitle,
                 interceptCallback, resolveKeyCallback, eventCallback,
                 user
             )
@@ -282,6 +293,45 @@ public final class RustPlayer {
     public var durationMs: Int64 { handle.map { rustplayer_player_duration_ms($0) } ?? 0 }
     public func setVolume(_ v: Float) { handle.map { rustplayer_player_set_volume($0, v) } }
 
+    // --- watch party (synchronised playback) ---
+
+    /// Allowed playback rates (`setPlaybackRate`).
+    public static let playbackRateRange: ClosedRange<Double> = 0.5...2.0
+
+    /// Playback rate, pitch preserved (1.0 = normal; clamped to
+    /// `playbackRateRange`). Built for small continuous corrections such as
+    /// watch-party drift. `false` when it cannot be applied (audio out as a
+    /// bitstream). Not yet tuned for direct (HDR layer) output, where a
+    /// non-1.0 rate re-anchors the layer timebase every few frames.
+    @discardableResult
+    public func setPlaybackRate(_ rate: Double) -> Bool {
+        handle.map { rustplayer_player_set_playback_rate($0, rate) } ?? false
+    }
+
+    /// The media position audible now (master clock).
+    public struct ClockPosition: Equatable {
+        public let positionMs: Int64
+        /// The timeline is moving (not paused, not buffering, audio running).
+        public let advancing: Bool
+        public let rate: Double
+    }
+
+    /// The media position audible now; finer than `positionMs` (last rendered
+    /// frame). nil without a player.
+    public func clockPosition() -> ClockPosition? {
+        guard let handle else { return nil }
+        var pos: Int64 = 0
+        var advancing = false
+        var rate: Double = 1
+        guard rustplayer_player_clock_position(handle, &pos, &advancing, &rate) else { return nil }
+        return ClockPosition(positionMs: pos, advancing: advancing, rate: rate)
+    }
+
+    /// Resume so the current position becomes audible `ms` from now (output
+    /// latency taken off); cancelled by any pause / play / seek. For
+    /// synchronised starts across devices.
+    public func resumeAfter(ms: Int64) { handle.map { rustplayer_player_resume_after($0, ms) } }
+
     /// Fetch ClearKey content keys WRAPPED from `url` instead of through the
     /// provider's resolveKey (see docs/CLEARKEY_WRAPPED_LICENCE.md): per KID an
     /// ephemeral ECDH P-256 exchange, HKDF-SHA256 and AES-256-GCM, so no key
@@ -402,6 +452,7 @@ public final class RustPlayer {
         case "playing": d?.rustPlayerDidStartPlaying(self)
         case "paused": d?.rustPlayerDidPause(self)
         case "buffering": d?.rustPlayerDidBuffer(self)
+        case "ready": d?.rustPlayer(self, readyAt: (obj["position_ms"] as? NSNumber)?.int64Value ?? 0)
         case "position":
             d?.rustPlayer(self,
                           position: (obj["position_ms"] as? NSNumber)?.int64Value ?? 0,

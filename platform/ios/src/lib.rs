@@ -314,6 +314,47 @@ pub extern "C" fn rustplayer_player_create_ex(
     event_cb: EventCb,
     user: *mut c_void,
 ) -> *mut c_void {
+    rustplayer_player_create_ex2(
+        metal_layer,
+        video_layer,
+        display_hdr_types,
+        width,
+        height,
+        manifest_url,
+        start_fraction,
+        -1,
+        false,
+        audio_passthrough,
+        auto_select_subtitle,
+        intercept_cb,
+        resolve_key_cb,
+        event_cb,
+        user,
+    )
+}
+
+/// [`rustplayer_player_create_ex`] plus the watch-party start:
+/// `start_position_ms` >= 0 starts at that position (wins over
+/// `start_fraction`), and `start_paused` primes the pipeline (first frame,
+/// `ready` event) and waits for `play` / `rustplayer_player_resume_after`.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_create_ex2(
+    metal_layer: *mut c_void,
+    video_layer: *mut c_void,
+    display_hdr_types: u32,
+    width: u32,
+    height: u32,
+    manifest_url: *const c_char,
+    start_fraction: f32,        // < 0 = no resume
+    start_position_ms: i64,     // < 0 = none
+    start_paused: bool,
+    audio_passthrough: i32,     // -1 = default, 0 = off, 1 = on
+    auto_select_subtitle: bool,
+    intercept_cb: InterceptCb,
+    resolve_key_cb: ResolveKeyCb,
+    event_cb: EventCb,
+    user: *mut c_void,
+) -> *mut c_void {
     ffi_guard("rustplayer_player_create", std::ptr::null_mut(), move || {
         init_once();
         if metal_layer.is_null() {
@@ -341,8 +382,14 @@ pub extern "C" fn rustplayer_player_create_ex(
         player.adopt_manifest_prefetch(prefetch);
         player.set_display_hdr_types(display_hdr_types);
         player.set_video_output_layer(video_layer);
+        // A watch party starts paused at the room's position and resumes in
+        // step with the room (`rustplayer_player_resume_after`).
+        if start_paused {
+            player.pause();
+        }
         let config = StartConfig {
-            start_position: None,
+            start_position: (start_position_ms >= 0)
+                .then(|| std::time::Duration::from_millis(start_position_ms as u64)),
             start_fraction: if start_fraction >= 0.0 {
                 Some(start_fraction)
             } else {
@@ -421,6 +468,65 @@ pub extern "C" fn rustplayer_player_position_ms(handle: *mut c_void) -> i64 {
         unsafe { handle_ref(handle) }
             .map(|h| h.bridge.position_ms())
             .unwrap_or(0)
+    })
+}
+
+/// Playback rate (1.0 = normal, clamped to 0.5..=2.0, pitch kept); see
+/// `Player::set_playback_rate`. `false` when it cannot be applied (audio out
+/// as a bitstream).
+#[no_mangle]
+pub extern "C" fn rustplayer_player_set_playback_rate(handle: *mut c_void, rate: f64) -> bool {
+    ffi_guard("rustplayer_player_set_playback_rate", false, move || {
+        unsafe { handle_ref(handle) }
+            .map(|h| {
+                let _guard = runtime().enter();
+                h.bridge.player().set_playback_rate(rate)
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// The media position audible now (`Player::clock_position`), finer than
+/// `rustplayer_player_position_ms` (last rendered frame). Writes each
+/// non-null out pointer; `false` (outputs untouched) without a player.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_clock_position(
+    handle: *mut c_void,
+    position_ms: *mut i64,
+    advancing: *mut bool,
+    rate: *mut f64,
+) -> bool {
+    ffi_guard("rustplayer_player_clock_position", false, move || {
+        let Some(h) = (unsafe { handle_ref(handle) }) else {
+            return false;
+        };
+        let c = h.bridge.player().clock_position();
+        unsafe {
+            if !position_ms.is_null() {
+                *position_ms = c.position.as_millis() as i64;
+            }
+            if !advancing.is_null() {
+                *advancing = c.advancing;
+            }
+            if !rate.is_null() {
+                *rate = c.rate;
+            }
+        }
+        true
+    })
+}
+
+/// Resume so the current position becomes audible `delay_ms` from now
+/// (`Player::resume_after`); cancelled by any pause / resume / seek.
+#[no_mangle]
+pub extern "C" fn rustplayer_player_resume_after(handle: *mut c_void, delay_ms: i64) {
+    ffi_guard("rustplayer_player_resume_after", (), move || {
+        if let Some(h) = unsafe { handle_ref(handle) } {
+            let _guard = runtime().enter();
+            h.bridge
+                .player()
+                .resume_after(std::time::Duration::from_millis(delay_ms.max(0) as u64));
+        }
     })
 }
 

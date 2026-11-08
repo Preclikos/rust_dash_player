@@ -16,6 +16,20 @@ pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
   `startPaused` (prime the pipeline, then wait for `play()` /
   `resumeAfter()`). Defaults keep existing callers unchanged.
 
+### iOS
+
+- **Watch-party surface on the SwiftPM package**, the same API.
+  `RustPlayer.setPlaybackRate(_:) -> Bool` (`playbackRateRange`
+  0.5…2.0), `clockPosition()` → `ClockPosition(positionMs, advancing,
+  rate)`, `resumeAfter(ms:)`, `RustPlayerDelegate.rustPlayer(_:readyAt:)`
+  (the `ready` event, default no-op), and two `start` parameters,
+  `startPositionMs` and `startPaused`, defaulted so existing callers are
+  unchanged. C ABI: `rustplayer_player_create_ex2` (`create_ex` plus
+  `start_position_ms` / `start_paused`; `create_ex` stays),
+  `rustplayer_player_set_playback_rate`, `rustplayer_player_clock_position`
+  (out pointers) and `rustplayer_player_resume_after`. A non-1.0 rate is
+  still not tuned for the direct (HDR layer) output.
+
 ## 0.3.3
 
 ### Web

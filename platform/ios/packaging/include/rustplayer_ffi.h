@@ -51,6 +51,16 @@ void *rustplayer_player_create_ex(void *metal_layer, void *video_layer, uint32_t
                        int32_t audio_passthrough, bool auto_select_subtitle,
                        rustplayer_intercept_cb intercept_cb, rustplayer_resolve_key_cb resolve_key_cb,
                        rustplayer_event_cb event_cb, void *user);
+// As above, plus the watch-party start: `start_position_ms` >= 0 starts at that
+// position (wins over `start_fraction`; < 0 = none), and `start_paused` primes
+// the pipeline (first frame, `ready` event) and waits for play / resume_after.
+void *rustplayer_player_create_ex2(void *metal_layer, void *video_layer, uint32_t display_hdr_types,
+                       uint32_t width, uint32_t height,
+                       const char *manifest_url, float start_fraction,
+                       int64_t start_position_ms, bool start_paused,
+                       int32_t audio_passthrough, bool auto_select_subtitle,
+                       rustplayer_intercept_cb intercept_cb, rustplayer_resolve_key_cb resolve_key_cb,
+                       rustplayer_event_cb event_cb, void *user);
 // Direct-mode layer after creation (applies from the next pipeline build).
 void rustplayer_player_set_video_output_layer(void *handle, void *video_layer);
 void rustplayer_player_set_size(void *handle, uint32_t width, uint32_t height, float scale);
@@ -63,6 +73,15 @@ bool rustplayer_player_is_paused(void *handle);
 void rustplayer_player_seek_ms(void *handle, int64_t position_ms);
 int64_t rustplayer_player_position_ms(void *handle);
 int64_t rustplayer_player_duration_ms(void *handle);
+// Playback rate (1.0 = normal, clamped to 0.5..2.0, pitch kept). False when it
+// cannot be applied (audio out as a bitstream / passthrough).
+bool rustplayer_player_set_playback_rate(void *handle, double rate);
+// The media position audible now (master clock), finer than position_ms (last
+// rendered frame). Writes each non-NULL out pointer; false without a player.
+bool rustplayer_player_clock_position(void *handle, int64_t *position_ms, bool *advancing, double *rate);
+// Resume so the current position becomes audible `delay_ms` from now (output
+// latency taken off); cancelled by any pause / play / seek.
+void rustplayer_player_resume_after(void *handle, int64_t delay_ms);
 void rustplayer_player_set_volume(void *handle, float volume);
 /* Wrapped ClearKey licence endpoint (docs/CLEARKEY_WRAPPED_LICENCE.md): this app version's
  * client secret (base64url) and its id for scenario A (NULL = scenario B). False = malformed. */
