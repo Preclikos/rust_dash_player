@@ -3,6 +3,16 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.3
+
+### Web
+
+- **Watch-party surface on the web package.** `RustPlayer.setPlaybackRate(rate)`,
+  `clockPosition()` → `{ positionMs, advancing, rate }` and
+  `resumeAfter(delayMs)` expose the 0.3.2 `Player` API, and the new
+  `startPaused: true` option of `create` primes the pipeline (first frame,
+  `ready` event) and waits for `play()` / `resumeAfter()`.
+
 ## 0.3.2
 
 ### All platforms

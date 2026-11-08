@@ -323,7 +323,9 @@ impl RustPlayer {
     /// wrappedLicence?: { url, secret, secretId? } (keys fetched wrapped, unwrapped into
     /// non-extractable WebCrypto keys — see docs/CLEARKEY_WRAPPED_LICENCE.md;
     /// auth headers via `intercept(url, "license")`),
-    /// hdr?: "auto" | "sdr" | "browser" }` — `hdr` defaults to `"auto"`: HDR
+    /// hdr?: "auto" | "sdr" | "browser", startPaused? }` — `startPaused: true`
+    /// primes the pipeline (first frame, `ready` event) and waits for `play()`
+    /// or `resumeAfter()`. `hdr` defaults to `"auto"`: HDR
     /// representations render through the engine's own PQ → SDR tonemap on
     /// the GPU (same numbers as the native players) when the renderer could
     /// verify the browser's frame conversion, else SDR representations only;
@@ -379,6 +381,12 @@ impl RustPlayer {
                 player.set_ass_offload(Arc::new(offload));
             }
         }
+        // `startPaused: true`: the pipeline builds and shows its first frame
+        // (`ready`), then waits for `play()` / `resumeAfter()` — a watch
+        // party starts it in step with the room.
+        if get(&options, "startPaused").and_then(|v| v.as_bool()) == Some(true) {
+            player.pause();
+        }
         let handle = bridge::start(player, manifest_url, host, config);
         Ok(RustPlayer { handle })
     }
@@ -409,6 +417,33 @@ impl RustPlayer {
     #[wasm_bindgen(js_name = durationMs)]
     pub fn duration_ms(&self) -> f64 {
         self.handle.duration_ms() as f64
+    }
+    /// Playback rate, 1.0 = normal, clamped to 0.5..=2.0 with the pitch kept
+    /// (`Player::set_playback_rate`). Persists across seeks and track
+    /// switches. `false` when the rate cannot be applied.
+    #[wasm_bindgen(js_name = setPlaybackRate)]
+    pub fn set_playback_rate(&self, rate: f64) -> bool {
+        self.handle.player().set_playback_rate(rate)
+    }
+    /// The master clock now (`Player::clock_position`): the media position
+    /// audible at the moment of the call, finer than `positionMs` (the last
+    /// rendered frame). `{ positionMs, advancing, rate }`.
+    #[wasm_bindgen(js_name = clockPosition)]
+    pub fn clock_position(&self) -> JsValue {
+        let c = self.handle.player().clock_position();
+        let obj = js_sys::Object::new();
+        let _ = Reflect::set(&obj, &"positionMs".into(), &(c.position.as_secs_f64() * 1000.0).into());
+        let _ = Reflect::set(&obj, &"advancing".into(), &c.advancing.into());
+        let _ = Reflect::set(&obj, &"rate".into(), &c.rate.into());
+        obj.into()
+    }
+    /// Resume so the current (paused) position becomes audible `delayMs`
+    /// from now, output latency taken off (`Player::resume_after`). For
+    /// synchronised starts across devices; cancelled by any play, pause or
+    /// seek in the meantime.
+    #[wasm_bindgen(js_name = resumeAfter)]
+    pub fn resume_after(&self, delay_ms: f64) {
+        self.handle.player().resume_after(Duration::from_secs_f64(delay_ms.max(0.0) / 1000.0));
     }
     /// Unified tracks snapshot JSON (`"{}"` until `tracks_ready`).
     #[wasm_bindgen(js_name = tracksJson)]
