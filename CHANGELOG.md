@@ -3,6 +3,19 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.9
+
+### All platforms
+
+- **A refused segment is no longer retried for the whole outage window.**
+  The download loop retried every failure for up to 3 minutes (backoff
+  capped at 5 s), so one dead URL answering 4xx produced ~35 requests per
+  track, and server-side ban rules (CrowdSec `http-probing`) count distinct
+  refused paths. A 4xx other than 408/425/429 now gets two more tries at
+  least 2 s apart (an expired link can come back renewed), then the segment
+  gives up and the pipeline's own bounded retry takes over. Network errors
+  and 5xx keep the long retry.
+
 ## 0.3.8
 
 ### Android

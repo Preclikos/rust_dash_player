@@ -107,6 +107,8 @@ pub(super) async fn download_task(
         let retry_started = Instant::now();
         let mut should_break = false;
         let mut last_err: Option<Box<dyn Error + Send + Sync>> = None;
+        // Refusals (4xx) of this segment so far; see `client_error_status`.
+        let mut refusals: u32 = 0;
         loop {
             // stop, or the receiver vanished (pipeline torn down) → terminate,
             // never retry a dropped channel.
@@ -160,6 +162,21 @@ pub(super) async fn download_task(
                         log::debug!("[dl] segment {} receiver gone — stopping (pipeline torn down)", i);
                         should_break = true;
                         break;
+                    }
+                    // A refused request (4xx) does not heal like a network
+                    // blip: retrying it for the whole outage window sent
+                    // ~35 requests per dead URL, and the server's ban rules
+                    // count distinct refused paths. A couple of retries (an
+                    // expired link can come back renewed), then give up.
+                    if let Some(status) = client_error_status(&e.to_string()) {
+                        refusals += 1;
+                        if refusals > MAX_SEGMENT_REFUSALS {
+                            log::error!("[dl] segment {} refused (http {}) {} times, giving up", i, status, refusals);
+                            gave_up = Some(e);
+                            should_break = true;
+                            break;
+                        }
+                        backoff = backoff.max(REFUSAL_BACKOFF);
                     }
                     log::warn!(
                         "[dl] segment {} failed, retrying in {:?}: {}",
@@ -778,3 +795,35 @@ pub(super) fn update_bandwidth_ewma(ewma: &AtomicU64, bytes: usize, elapsed: Dur
     ewma.store(next, Ordering::Relaxed);
 }
 
+/// Retries of one segment after the server refused it (4xx).
+const MAX_SEGMENT_REFUSALS: u32 = 2;
+/// The least wait before retrying a refused segment.
+const REFUSAL_BACKOFF: Duration = Duration::from_secs(2);
+
+/// The status of a refusal that retrying will not fix: a 4xx other than the
+/// timeouts and "slow down" ones (408, 425, 429), which the HTTP client
+/// already retries itself. From the error text (`http <status>`).
+pub(super) fn client_error_status(detail: &str) -> Option<u16> {
+    match super::text::request_error_kind(detail) {
+        PlayerErrorKind::Http { status } if (400..500).contains(&status) && !matches!(status, 408 | 425 | 429) => {
+            Some(status)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::client_error_status;
+
+    #[test]
+    fn refusals_are_4xx_but_not_the_retryable_ones() {
+        assert_eq!(client_error_status("segment 3: http 404"), Some(404));
+        assert_eq!(client_error_status("http 400"), Some(400));
+        assert_eq!(client_error_status("http 403 (expired link)"), Some(403));
+        assert_eq!(client_error_status("http 429"), None);
+        assert_eq!(client_error_status("http 408"), None);
+        assert_eq!(client_error_status("http 503"), None);
+        assert_eq!(client_error_status("connection refused"), None);
+    }
+}
