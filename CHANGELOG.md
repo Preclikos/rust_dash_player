@@ -3,6 +3,22 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.8
+
+### Android
+
+- **Slow decoder release (Realtek).** On some SoCs the vendor video service
+  gives the decoder core back only seconds after `AMediaCodec_delete`, in
+  its own process. A codec created sooner (an ABR switch the old codec
+  cannot take in place, a retry, the next title) configures fine and then
+  fails its first frame with `dequeueOutputBuffer -10000`, and so does
+  every retry that comes too soon (seen on a TCL / RTD2875P in Crashlytics;
+  Jellyfin Android TV #5908). `OMX.realtek.*` decoders, and any device where
+  a fresh codec fails before its first frame within 6 s of a delete, now
+  get their next direct codec no sooner than 4 s after the last delete
+  (abortable). The error context reports `slow release (waited …ms,
+  created …ms after a delete)`.
+
 ## 0.3.7
 
 ### Android

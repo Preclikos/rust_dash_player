@@ -105,6 +105,13 @@ pub struct MediaCodecDecoder {
     max_instances: Option<i32>,
     prev_codec_wait_ms: u32,
     retried_alone: bool,
+    /// The platform's decoder for this mime (from the codec list, before
+    /// one is created), for the slow-release rule below.
+    decoder_hint: String,
+    /// When this decoder's direct codec was created (uptime ms; 0 = none),
+    /// and how long configure held off for a slow release.
+    created_ms: u64,
+    slow_release_wait_ms: u32,
 }
 
 /// Learned in this process: a decoder refused to start while a previous
@@ -113,8 +120,31 @@ pub struct MediaCodecDecoder {
 /// every direct configure takes the safe handoff.
 static EXCLUSIVE_LEARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// `maxSupportedInstances` per mime, looked up once (JNI walk of the codec list).
-static MAX_INSTANCES: std::sync::Mutex<Vec<(String, Option<i32>)>> = std::sync::Mutex::new(Vec::new());
+/// `(decoder name, maxSupportedInstances)` per mime, looked up once (JNI walk
+/// of the codec list).
+static MAX_INSTANCES: std::sync::Mutex<Vec<(String, Option<(String, i32)>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Slow release: the vendor video service gives the decoder core back only
+/// seconds after `AMediaCodec_delete`, in its own process, where none of our
+/// counters see it. A codec created before that configures fine and then
+/// fails its first frame (`dequeueOutputBuffer -10000`), and so does every
+/// retry that comes too soon. Realtek (`OMX.realtek.*`, TCL Google TVs) is
+/// known for it (Jellyfin Android TV #5908, and our own Crashlytics on an
+/// RTD2875P); elsewhere it is learned: a fresh codec that fails before its
+/// first frame shortly after a previous delete.
+static SLOW_RELEASE_LEARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Uptime (ms) of the last direct `AMediaCodec_delete` of this process; 0 = none yet.
+static LAST_DIRECT_DELETE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long after a delete a slow-release device gets its next codec. The
+/// Realtek service retries for a few seconds and is forced to let go after
+/// about three.
+const SLOW_RELEASE_COOLDOWN_MS: u64 = 4_000;
+
+/// A fresh codec failing before its first frame this soon after a delete
+/// counts as a slow release.
+const SLOW_RELEASE_SUSPECT_MS: u64 = 6_000;
 
 /// How long the safe handoff waits for a previous codec to be deleted. Its
 /// last frames leave the queue within a frame or two while playing; past
@@ -652,6 +682,7 @@ impl Drop for SharedDirectCodec {
         unsafe {
             ndk_sys::AMediaCodec_delete(self.raw);
             OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            LAST_DIRECT_DELETE_MS.store(uptime_ms(), std::sync::atomic::Ordering::Release);
             let w = self.window.load(std::sync::atomic::Ordering::Acquire);
             if !w.is_null() {
                 ndk_sys::ANativeWindow_release(w);
@@ -746,6 +777,9 @@ impl MediaCodecDecoder {
             max_instances: None,
             prev_codec_wait_ms: 0,
             retried_alone: false,
+            decoder_hint: String::new(),
+            created_ms: 0,
+            slow_release_wait_ms: 0,
         }
     }
 
@@ -914,19 +948,19 @@ impl MediaCodecDecoder {
     /// `maxSupportedInstances` of the first hardware decoder registered for
     /// `mime` (the one `createDecoderByType` picks), cached per mime. `None`
     /// on JNI trouble or when no such decoder is listed.
-    fn max_instances(mime: &str) -> Option<i32> {
+    fn max_instances(mime: &str) -> Option<(String, i32)> {
         if let Some((_, n)) = MAX_INSTANCES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
             .find(|(m, _)| m == mime)
         {
-            return *n;
+            return n.clone();
         }
         let ctx = ndk_context::android_context();
         let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
         let n = vm
-            .attach_current_thread(|env| -> Result<Option<i32>, jni::errors::Error> {
+            .attach_current_thread(|env| -> Result<Option<(String, i32)>, jni::errors::Error> {
                 // MediaCodecList(MediaCodecList.REGULAR_CODECS = 0)
                 let list = env.new_object(
                     jni::jni_str!("android/media/MediaCodecList"),
@@ -992,7 +1026,7 @@ impl MediaCodecDecoder {
                         .call_method(&caps, jni::jni_str!("getMaxSupportedInstances"), jni::jni_sig!("()I"), &[])?
                         .i()?;
                     log::info!("MediaCodecDecoder: {} for {} reports max {} instance(s)", name, mime, max);
-                    return Ok(Some(max));
+                    return Ok(Some((name, max)));
                 }
                 Ok(None)
             })
@@ -1001,8 +1035,59 @@ impl MediaCodecDecoder {
         MAX_INSTANCES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push((mime.to_string(), n));
+            .push((mime.to_string(), n.clone()));
         n
+    }
+
+    /// This device gives decoder cores back late (see [`SLOW_RELEASE_LEARNED`]).
+    fn slow_release(&self) -> bool {
+        SLOW_RELEASE_LEARNED.load(std::sync::atomic::Ordering::Acquire)
+            || self.decoder_hint.to_ascii_lowercase().starts_with("omx.realtek.")
+            || self.codec_label.to_ascii_lowercase().starts_with("omx.realtek.")
+    }
+
+    /// Hold off (bounded by the cooldown, abortable by the stop signal) until
+    /// [`SLOW_RELEASE_COOLDOWN_MS`] have passed since the last direct delete.
+    /// Returns the ms waited.
+    fn wait_for_slow_release(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        let last = LAST_DIRECT_DELETE_MS.load(Ordering::Acquire);
+        if last == 0 {
+            return 0;
+        }
+        let mut waited = 0u32;
+        while uptime_ms().saturating_sub(last) < SLOW_RELEASE_COOLDOWN_MS && !self.stop_requested() {
+            std::thread::sleep(Duration::from_millis(20));
+            waited += 20;
+        }
+        if waited > 0 {
+            log::info!("[mc-direct] slow-release device: waited {}ms after the last codec delete", waited);
+        }
+        waited
+    }
+
+    /// A direct-codec error. A fresh codec that fails before its first frame
+    /// soon after a previous delete marks the device as slow-release, so the
+    /// supervisor's retry (and every codec after it) waits for the vendor
+    /// service to let the core go.
+    fn direct_failure(&self, e: String) -> DecoderError {
+        use std::sync::atomic::Ordering;
+        let last = LAST_DIRECT_DELETE_MS.load(Ordering::Acquire);
+        if self.decoded_frame_idx == 0
+            && last != 0
+            && self.created_ms != 0
+            && self.created_ms.saturating_sub(last) < SLOW_RELEASE_SUSPECT_MS
+            && !self.stop_requested()
+            && !SLOW_RELEASE_LEARNED.swap(true, Ordering::AcqRel)
+        {
+            log::warn!(
+                "[mc-direct] {} failed before its first frame {}ms after a codec delete ({}); slow release from now on",
+                self.codec_label,
+                self.created_ms.saturating_sub(last),
+                e
+            );
+        }
+        e.into()
     }
 
     /// Wait (bounded, abortable by the stop signal) until no other direct
@@ -1049,13 +1134,22 @@ impl MediaCodecDecoder {
     ///   and tries once more here rather than failing the whole pipeline.
     fn configure_direct(&mut self, params: &VideoDecoderParams, mime: &str) -> Result<(), DecoderError> {
         use std::sync::atomic::Ordering;
-        self.max_instances = Self::max_instances(mime);
+        let found = Self::max_instances(mime);
+        self.decoder_hint = found.as_ref().map(|(n, _)| n.clone()).unwrap_or_default();
+        self.max_instances = found.map(|(_, m)| m);
         self.prev_codec_wait_ms = 0;
         self.retried_alone = false;
+        self.slow_release_wait_ms = 0;
+        self.created_ms = 0;
         let exclusive =
             EXCLUSIVE_LEARNED.load(Ordering::Acquire) || self.max_instances.is_some_and(|n| n <= 1);
-        if exclusive && OPEN_DIRECT_CODECS.load(Ordering::Acquire) > 0 {
+        // A slow-release device needs the previous codec deleted too, before
+        // its cooldown can even start.
+        if (exclusive || self.slow_release()) && OPEN_DIRECT_CODECS.load(Ordering::Acquire) > 0 {
             self.prev_codec_wait_ms = self.wait_for_previous_codecs();
+        }
+        if self.slow_release() {
+            self.slow_release_wait_ms = self.wait_for_slow_release();
         }
         match self.configure_direct_once(params, mime) {
             Ok(()) => Ok(()),
@@ -1077,6 +1171,9 @@ impl MediaCodecDecoder {
                     );
                 }
                 self.prev_codec_wait_ms += self.wait_for_previous_codecs();
+                if self.slow_release() {
+                    self.slow_release_wait_ms += self.wait_for_slow_release();
+                }
                 self.retried_alone = true;
                 self.configure_direct_once(params, mime).map_err(|e| -> DecoderError {
                     format!("{e} (first attempt, beside a previous codec: {first})").into()
@@ -1131,6 +1228,7 @@ impl MediaCodecDecoder {
                 .into());
             }
             OPEN_DIRECT_CODECS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.created_ms = uptime_ms();
             self.codec_label = Self::codec_name(codec).unwrap_or_else(|| mime.to_string());
 
             // In-place ABR switches: configure for the ladder's largest
@@ -1240,6 +1338,7 @@ impl MediaCodecDecoder {
             if st != ndk_sys::media_status_t::AMEDIA_OK {
                 ndk_sys::AMediaCodec_delete(codec);
                 OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                LAST_DIRECT_DELETE_MS.store(uptime_ms(), std::sync::atomic::Ordering::Release);
                 // No SharedDirectCodec will be created to release the gate.
                 DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("AMediaCodec_configure(direct): {:?}", st).into());
@@ -1248,6 +1347,7 @@ impl MediaCodecDecoder {
             if st != ndk_sys::media_status_t::AMEDIA_OK {
                 ndk_sys::AMediaCodec_delete(codec);
                 OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                LAST_DIRECT_DELETE_MS.store(uptime_ms(), std::sync::atomic::Ordering::Release);
                 DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("AMediaCodec_start(direct): {:?}", st).into());
             }
@@ -1332,7 +1432,7 @@ impl MediaCodecDecoder {
                     }
                     if idx != -1 {
                         // Anything but AMEDIACODEC_INFO_TRY_AGAIN_LATER (-1).
-                        return Err(format!("dequeueInputBuffer(direct): {}", idx).into());
+                        return Err(self.direct_failure(format!("dequeueInputBuffer(direct): {}", idx)));
                     }
                     if retries == 0 {
                         let _ = direct.input_blocked_since_ms.compare_exchange(
@@ -1401,7 +1501,7 @@ impl MediaCodecDecoder {
                 ndk_sys::AMediaCodec_queueInputBuffer(direct.raw, idx, 0, len, pts_us as u64, 0)
             };
             if st != ndk_sys::media_status_t::AMEDIA_OK {
-                return Err(format!("queueInputBuffer(direct): {:?}", st).into());
+                return Err(self.direct_failure(format!("queueInputBuffer(direct): {:?}", st)));
             }
         }
         Ok(())
@@ -1500,7 +1600,7 @@ impl MediaCodecDecoder {
                     }
                     Ok(None)
                 }
-                other => Err(format!("dequeueOutputBuffer(direct): {}", other).into()),
+                other => Err(self.direct_failure(format!("dequeueOutputBuffer(direct): {}", other))),
             }
         }
     }
@@ -1535,6 +1635,14 @@ impl HwVideoDecoder for MediaCodecDecoder {
             }
             if self.retried_alone {
                 s.push_str(", retried after the previous codec");
+            }
+            if self.slow_release() {
+                s.push_str(&format!(", slow release (waited {}ms", self.slow_release_wait_ms));
+                let last = LAST_DIRECT_DELETE_MS.load(std::sync::atomic::Ordering::Acquire);
+                if last != 0 && self.created_ms != 0 {
+                    s.push_str(&format!(", created {}ms after a delete", self.created_ms.saturating_sub(last)));
+                }
+                s.push(')');
             }
             if self.surface_wait_ms > 0 || self.surface_forced {
                 s.push_str(&format!(
