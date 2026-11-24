@@ -98,7 +98,28 @@ pub struct MediaCodecDecoder {
     configured_size: (u32, u32),
     surface_wait_ms: u32,
     surface_forced: bool,
+    /// The safe handoff (see [`MediaCodecDecoder::configure_direct`]): how
+    /// many instances the platform says its decoder for this mime can run
+    /// (`None` = unknown), how long configure waited for a previous codec to
+    /// be deleted, and whether a first attempt failed beside one.
+    max_instances: Option<i32>,
+    prev_codec_wait_ms: u32,
+    retried_alone: bool,
 }
+
+/// Learned in this process: a decoder refused to start while a previous
+/// codec was still alive, although it claimed room for more instances
+/// (`maxSupportedInstances` is not reliable on every vendor). From then on
+/// every direct configure takes the safe handoff.
+static EXCLUSIVE_LEARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `maxSupportedInstances` per mime, looked up once (JNI walk of the codec list).
+static MAX_INSTANCES: std::sync::Mutex<Vec<(String, Option<i32>)>> = std::sync::Mutex::new(Vec::new());
+
+/// How long the safe handoff waits for a previous codec to be deleted. Its
+/// last frames leave the queue within a frame or two while playing; past
+/// this something holds them (paused) and we go ahead as before.
+const PREV_CODEC_WAIT_MS: u32 = 3_000;
 
 /// Direct codecs of this process alive right now (created, not yet
 /// `AMediaCodec_delete`d). More than one at a decoder error means our own
@@ -722,6 +743,9 @@ impl MediaCodecDecoder {
             configured_size: (0, 0),
             surface_wait_ms: 0,
             surface_forced: false,
+            max_instances: None,
+            prev_codec_wait_ms: 0,
+            retried_alone: false,
         }
     }
 
@@ -887,8 +911,184 @@ impl MediaCodecDecoder {
         .flatten()
     }
 
+    /// `maxSupportedInstances` of the first hardware decoder registered for
+    /// `mime` (the one `createDecoderByType` picks), cached per mime. `None`
+    /// on JNI trouble or when no such decoder is listed.
+    fn max_instances(mime: &str) -> Option<i32> {
+        if let Some((_, n)) = MAX_INSTANCES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(m, _)| m == mime)
+        {
+            return *n;
+        }
+        let ctx = ndk_context::android_context();
+        let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
+        let n = vm
+            .attach_current_thread(|env| -> Result<Option<i32>, jni::errors::Error> {
+                // MediaCodecList(MediaCodecList.REGULAR_CODECS = 0)
+                let list = env.new_object(
+                    jni::jni_str!("android/media/MediaCodecList"),
+                    jni::jni_sig!("(I)V"),
+                    &[0i32.into()],
+                )?;
+                let infos = env
+                    .call_method(
+                        &list,
+                        jni::jni_str!("getCodecInfos"),
+                        jni::jni_sig!("()[Landroid/media/MediaCodecInfo;"),
+                        &[],
+                    )?
+                    .l()?;
+                let infos = env.cast_local::<jni::objects::JObjectArray>(infos)?;
+                let len = infos.len(env)?;
+                for i in 0..len {
+                    let info = infos.get_element(env, i)?;
+                    if env.call_method(&info, jni::jni_str!("isEncoder"), jni::jni_sig!("()Z"), &[])?.z()? {
+                        continue;
+                    }
+                    let jname = env
+                        .call_method(&info, jni::jni_str!("getName"), jni::jni_sig!("()Ljava/lang/String;"), &[])?
+                        .l()?;
+                    let name = env.cast_local::<jni::objects::JString>(jname)?.try_to_string(env)?;
+                    // Software decoders never hold the scarce hardware slot.
+                    let lower = name.to_ascii_lowercase();
+                    if lower.starts_with("omx.google.") || lower.starts_with("c2.android.") || lower.contains(".sw.") {
+                        continue;
+                    }
+                    let types = env
+                        .call_method(
+                            &info,
+                            jni::jni_str!("getSupportedTypes"),
+                            jni::jni_sig!("()[Ljava/lang/String;"),
+                            &[],
+                        )?
+                        .l()?;
+                    let types = env.cast_local::<jni::objects::JObjectArray>(types)?;
+                    let tn = types.len(env)?;
+                    let mut matches = false;
+                    for t in 0..tn {
+                        let jt = types.get_element(env, t)?;
+                        let ty = env.cast_local::<jni::objects::JString>(jt)?.try_to_string(env)?;
+                        if ty.eq_ignore_ascii_case(mime) {
+                            matches = true;
+                            break;
+                        }
+                    }
+                    if !matches {
+                        continue;
+                    }
+                    let jmime = env.new_string(mime)?;
+                    let caps = env
+                        .call_method(
+                            &info,
+                            jni::jni_str!("getCapabilitiesForType"),
+                            jni::jni_sig!("(Ljava/lang/String;)Landroid/media/MediaCodecInfo$CodecCapabilities;"),
+                            &[(&jmime).into()],
+                        )?
+                        .l()?;
+                    let max = env
+                        .call_method(&caps, jni::jni_str!("getMaxSupportedInstances"), jni::jni_sig!("()I"), &[])?
+                        .i()?;
+                    log::info!("MediaCodecDecoder: {} for {} reports max {} instance(s)", name, mime, max);
+                    return Ok(Some(max));
+                }
+                Ok(None)
+            })
+            .ok()
+            .flatten();
+        MAX_INSTANCES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((mime.to_string(), n));
+        n
+    }
+
+    /// Wait (bounded, abortable by the stop signal) until no other direct
+    /// codec of this process is alive. Returns the ms waited.
+    fn wait_for_previous_codecs(&self) -> u32 {
+        use std::sync::atomic::Ordering;
+        let mut waited = 0u32;
+        while OPEN_DIRECT_CODECS.load(Ordering::Acquire) > 0
+            && waited < PREV_CODEC_WAIT_MS
+            && !self.stop_requested()
+        {
+            std::thread::sleep(Duration::from_millis(5));
+            waited += 5;
+        }
+        let left = OPEN_DIRECT_CODECS.load(Ordering::Acquire);
+        if left > 0 {
+            log::warn!(
+                "[mc-direct] {} previous codec(s) still alive after {}ms; configuring beside them",
+                left,
+                waited
+            );
+        } else {
+            log::info!("[mc-direct] previous codec gone after {}ms", waited);
+        }
+        waited
+    }
+
     /// Direct-mode configure: raw FFI codec attached to the video Surface.
+    ///
+    /// A format switch the old codec cannot take in place (another codec,
+    /// bit depth, HDR transfer, a bigger picture) builds a new codec while
+    /// the old one is stopped but not yet deleted: its last frames are still
+    /// queued, and `AMediaCodec_delete` waits for them. A stopped codec still
+    /// holds its hardware instance, so on a SoC with a single (4K) decoder
+    /// instance the new one fails to create or configure (the Realtek
+    /// pattern of Jellyfin Android TV #5908).
+    ///
+    /// - Decoder with room for more instances: no waiting, the switch stays
+    ///   as fast as it was.
+    /// - Single instance (or learned so, below): wait until the previous
+    ///   codec is deleted, then create.
+    /// - A first attempt that fails while a previous codec is alive marks
+    ///   the device as single-instance for the rest of the process, waits,
+    ///   and tries once more here rather than failing the whole pipeline.
     fn configure_direct(&mut self, params: &VideoDecoderParams, mime: &str) -> Result<(), DecoderError> {
+        use std::sync::atomic::Ordering;
+        self.max_instances = Self::max_instances(mime);
+        self.prev_codec_wait_ms = 0;
+        self.retried_alone = false;
+        let exclusive =
+            EXCLUSIVE_LEARNED.load(Ordering::Acquire) || self.max_instances.is_some_and(|n| n <= 1);
+        if exclusive && OPEN_DIRECT_CODECS.load(Ordering::Acquire) > 0 {
+            self.prev_codec_wait_ms = self.wait_for_previous_codecs();
+        }
+        match self.configure_direct_once(params, mime) {
+            Ok(()) => Ok(()),
+            // Our own failed codec is deleted again by now, so this counts
+            // only the previous ones.
+            // Not for Dolby Vision: its failure is usually a profile the
+            // device lacks, and the caller falls back to HEVC, which then
+            // gets this retry.
+            Err(first)
+                if mime != "video/dolby-vision"
+                    && OPEN_DIRECT_CODECS.load(Ordering::Acquire) > 0
+                    && !self.stop_requested() =>
+            {
+                if !EXCLUSIVE_LEARNED.swap(true, Ordering::AcqRel) {
+                    log::warn!(
+                        "[mc-direct] {} failed beside a previous codec ({}); safe handoff from now on",
+                        mime,
+                        first
+                    );
+                }
+                self.prev_codec_wait_ms += self.wait_for_previous_codecs();
+                self.retried_alone = true;
+                self.configure_direct_once(params, mime).map_err(|e| -> DecoderError {
+                    format!("{e} (first attempt, beside a previous codec: {first})").into()
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// One attempt of [`configure_direct`](Self::configure_direct). On error
+    /// nothing it created is left alive.
+    fn configure_direct_once(&mut self, params: &VideoDecoderParams, mime: &str) -> Result<(), DecoderError> {
         use std::ffi::CString;
         unsafe {
             let mime_c = CString::new(mime).unwrap();
@@ -1324,6 +1524,18 @@ impl HwVideoDecoder for MediaCodecDecoder {
         if self.direct_window != 0 {
             let open = OPEN_DIRECT_CODECS.load(std::sync::atomic::Ordering::Acquire);
             s.push_str(&format!(", open direct codecs {open}"));
+            if let Some(n) = self.max_instances {
+                s.push_str(&format!(", max instances {n}"));
+            }
+            if EXCLUSIVE_LEARNED.load(std::sync::atomic::Ordering::Acquire) {
+                s.push_str(", safe handoff learned");
+            }
+            if self.prev_codec_wait_ms > 0 {
+                s.push_str(&format!(", waited {}ms for the previous codec", self.prev_codec_wait_ms));
+            }
+            if self.retried_alone {
+                s.push_str(", retried after the previous codec");
+            }
             if self.surface_wait_ms > 0 || self.surface_forced {
                 s.push_str(&format!(
                     ", surface wait {}ms{}",

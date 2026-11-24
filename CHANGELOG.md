@@ -3,6 +3,27 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.7
+
+### Android
+
+- **Safe decoder handoff on single-instance decoders.** A format switch the
+  old codec cannot take in place (another codec, bit depth, HDR transfer, a
+  bigger picture), a retry, or a new player right after the previous one
+  used to create the new MediaCodec while the old one was stopped but not
+  yet deleted (its last frames still queued). A stopped codec keeps its
+  hardware instance, so on SoCs with one (4K) decoder instance the new one
+  failed to create or configure (the Realtek pattern of Jellyfin Android TV
+  #5908) and playback recovered only through a pipeline retry, or ended in
+  a `decoder` error. Now the player asks the platform how many instances
+  the decoder runs (`maxSupportedInstances`): with room for more nothing
+  changes; with one it waits (up to 3 s, abortable) until the previous
+  codec is deleted. A first attempt that still fails beside a previous
+  codec switches the process to the safe handoff, waits and retries once in
+  place (Dolby Vision excepted, it falls back to HEVC). The error context
+  gains `max instances N`, `safe handoff learned`, `waited …ms for the
+  previous codec` and `retried after the previous codec`.
+
 ## 0.3.6
 
 ### Android
