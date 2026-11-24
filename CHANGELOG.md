@@ -3,6 +3,25 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.10
+
+### Android
+
+- **A direct codec is moved off the screen before it is stopped.** Its
+  output goes to the private placeholder surface (the one Home already
+  uses), which hands every buffer back at once, and only then
+  `AMediaCodec_stop` runs. Stopped while some of its frames still sat on
+  the display, an OMX codec waited for those buffers; on Realtek the vendor
+  service then let the decoder core go only when its watchdog forced it,
+  about 3 s later, and the next codec failed its first frame (Jellyfin
+  Android TV #5908). ExoPlayer drains a codec before releasing it for the
+  same reason. Same on every device; on fast-release Codec2 decoders it
+  costs ~45 ms at an ABR switch the old codec cannot take in place.
+  Measured on a Galaxy S21 (A/B, 19 releases each, no errors).
+- Decoder errors now say how the previous codec went away
+  (`previous codec parked, stop Nms, delete Nms`), so field reports show
+  whether the release was prompt.
+
 ## 0.3.9
 
 ### All platforms

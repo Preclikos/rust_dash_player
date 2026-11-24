@@ -204,6 +204,8 @@ pub struct SharedDirectCodec {
     /// output buffer is out (queued in SurfaceFlinger or held by us): the
     /// release lead is starving the decoder (see `crate::present_lead`).
     input_blocked_since_ms: std::sync::atomic::AtomicU64,
+    /// Set by [`stop`](Self::stop), reported when the codec is deleted.
+    teardown: std::sync::Mutex<Option<Teardown>>,
 }
 
 /// Monotonic ms since the first call, offset by 1 so 0 can mean "unset".
@@ -593,43 +595,11 @@ pub fn retarget_direct_output(window: usize) -> Retarget {
 /// false when there is no live codec or the switch is refused.
 pub fn park_direct_output() -> bool {
     let Some(codec) = live_direct() else { return false };
-    let (w, h) = codec.size;
-    let reader = ImageReader::new_with_usage(
-        w.max(2),
-        h.max(2),
-        ImageFormat::PRIVATE,
-        HardwareBufferUsage::GPU_SAMPLED_IMAGE,
-        4,
-    );
-    let mut reader = match reader {
-        Ok(r) => r,
-        Err(e) => {
-            log::warn!("[mc-direct] placeholder surface: {:?}", e);
-            return false;
-        }
-    };
-    // Recycle every buffer at once so the codec never waits on the consumer.
-    let _ = reader.set_image_listener(Box::new(|r: &ImageReader| {
-        while let Ok(AcquireResult::Image(img)) = r.acquire_next_image() {
-            drop(img);
-        }
-    }));
-    let window = match reader.window() {
-        Ok(win) => win,
-        Err(e) => {
-            log::warn!("[mc-direct] placeholder window: {:?}", e);
-            return false;
-        }
-    };
-    let _l = codec.call_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let st = unsafe { codec.switch_output(window.ptr().as_ptr()) };
-    if st != ndk_sys::media_status_t::AMEDIA_OK {
-        log::warn!("[mc-direct] setOutputSurface(placeholder) -> {:?}", st);
-        return false;
+    let parked = codec.park();
+    if parked {
+        log::info!("[mc-direct] output parked on a placeholder surface");
     }
-    *codec.placeholder.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader);
-    log::info!("[mc-direct] output parked on a placeholder surface");
-    true
+    parked
 }
 
 unsafe impl Send for SharedDirectCodec {}
@@ -666,19 +636,99 @@ impl SharedDirectCodec {
         let _ = unsafe { ndk_sys::AMediaCodec_releaseOutputBuffer(self.raw, index, false) };
     }
 
-    /// Teardown: invalidate all outstanding release handles, then stop.
+    /// Move the output onto a private placeholder surface that recycles
+    /// every buffer at once. True when the codec renders into one now
+    /// (already, or after this call); false when it could not be moved and
+    /// stays where it was.
+    fn park(&self) -> bool {
+        // Not held across call_lock: retarget_direct_output takes the two
+        // the other way round.
+        if self.placeholder.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            return true;
+        }
+        let (w, h) = self.size;
+        let reader = ImageReader::new_with_usage(
+            w.max(2),
+            h.max(2),
+            ImageFormat::PRIVATE,
+            HardwareBufferUsage::GPU_SAMPLED_IMAGE,
+            4,
+        );
+        let mut reader = match reader {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("[mc-direct] placeholder surface: {:?}", e);
+                return false;
+            }
+        };
+        // Recycle every buffer at once so the codec never waits on the consumer.
+        let _ = reader.set_image_listener(Box::new(|r: &ImageReader| {
+            while let Ok(AcquireResult::Image(img)) = r.acquire_next_image() {
+                drop(img);
+            }
+        }));
+        let window = match reader.window() {
+            Ok(win) => win,
+            Err(e) => {
+                log::warn!("[mc-direct] placeholder window: {:?}", e);
+                return false;
+            }
+        };
+        let _l = self.call_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let st = unsafe { self.switch_output(window.ptr().as_ptr()) };
+        if st != ndk_sys::media_status_t::AMEDIA_OK {
+            log::warn!("[mc-direct] setOutputSurface(placeholder) -> {:?}", st);
+            return false;
+        }
+        // Still under call_lock, so a retarget cannot run in between.
+        *self.placeholder.lock().unwrap_or_else(|e| e.into_inner()) = Some(reader);
+        true
+    }
+
+    /// Teardown: park the output, invalidate all outstanding release
+    /// handles, then stop.
+    ///
+    /// Stopped while frames of it still sit on the display, an OMX codec
+    /// waits for those buffers to come back; on Realtek the vendor service
+    /// then gives the decoder core up only when its watchdog forces it,
+    /// about 3 s later (Jellyfin Android TV #5908), and the next codec
+    /// fails its first frame meanwhile. ExoPlayer drains a codec to end of
+    /// stream before releasing it for the same reason. The placeholder
+    /// hands every buffer back at once. Best effort: a codec that refuses
+    /// the move is stopped where it is, as before.
     fn stop(&self) {
+        let t0 = std::time::Instant::now();
+        let parked = self.park();
+        let park_us = t0.elapsed().as_micros() as u64;
         self.stopped.store(true, std::sync::atomic::Ordering::Release);
         let _l = self.call_lock.lock().unwrap();
+        let t1 = std::time::Instant::now();
         unsafe {
             ndk_sys::AMediaCodec_stop(self.raw);
         }
+        let stop_us = t1.elapsed().as_micros() as u64;
+        *self.teardown.lock().unwrap_or_else(|e| e.into_inner()) = Some(Teardown { parked, park_us, stop_us });
     }
 }
+
+/// How a direct codec went away: whether its output was parked first, and
+/// what parking and `AMediaCodec_stop` took.
+#[derive(Clone, Copy, Debug)]
+struct Teardown {
+    parked: bool,
+    park_us: u64,
+    stop_us: u64,
+}
+
+/// The last finished teardown and its `AMediaCodec_delete` time (µs). The
+/// next codec's error context reports it, so field reports show whether the
+/// previous decoder was released promptly.
+static LAST_TEARDOWN: std::sync::Mutex<Option<(Teardown, u64)>> = std::sync::Mutex::new(None);
 
 impl Drop for SharedDirectCodec {
     fn drop(&mut self) {
         // Last reference (decoder + every in-flight frame) gone.
+        let t0 = std::time::Instant::now();
         unsafe {
             ndk_sys::AMediaCodec_delete(self.raw);
             OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
@@ -691,6 +741,17 @@ impl Drop for SharedDirectCodec {
         // [C2] The Surface producer connection is now released (delete is
         // synchronous) — let the next direct codec configure onto it.
         DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
+        let delete_us = t0.elapsed().as_micros() as u64;
+        if let Some(t) = *self.teardown.lock().unwrap_or_else(|e| e.into_inner()) {
+            log::info!(
+                "[mc-direct] codec released: parked={} park {} us, stop {} us, delete {} us",
+                t.parked,
+                t.park_us,
+                t.stop_us,
+                delete_us
+            );
+            *LAST_TEARDOWN.lock().unwrap_or_else(|e| e.into_inner()) = Some((t, delete_us));
+        }
     }
 }
 
@@ -1363,6 +1424,7 @@ impl MediaCodecDecoder {
                 placeholder: std::sync::Mutex::new(None),
                 deferred: std::sync::Mutex::new((false, Vec::new())),
                 input_blocked_since_ms: std::sync::atomic::AtomicU64::new(0),
+                teardown: std::sync::Mutex::new(None),
             }));
             register_rendered_callback(codec);
             if let Some(d) = &self.direct {
@@ -1643,6 +1705,14 @@ impl HwVideoDecoder for MediaCodecDecoder {
                     s.push_str(&format!(", created {}ms after a delete", self.created_ms.saturating_sub(last)));
                 }
                 s.push(')');
+            }
+            if let Some((t, delete_us)) = *LAST_TEARDOWN.lock().unwrap_or_else(|e| e.into_inner()) {
+                s.push_str(&format!(
+                    ", previous codec {} stop {}ms, delete {}ms",
+                    if t.parked { "parked" } else { "not parked" },
+                    t.stop_us / 1000,
+                    delete_us / 1000
+                ));
             }
             if self.surface_wait_ms > 0 || self.surface_forced {
                 s.push_str(&format!(
