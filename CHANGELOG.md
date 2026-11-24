@@ -3,6 +3,28 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.6
+
+### Android
+
+- **A decoder error now says what happened.** The `detail` of a `decoder`
+  error (and of any pipeline error the supervisor gives up on) carries the
+  whole retry streak instead of only its last failure: the final error
+  first (the `kind` is still derived from it), then `| gave up after N
+  failure(s); decoded … dropped … frames; decoder "…"` and every earlier
+  failure as `| #i at <pos>s: …` (the first one is kept even in a long
+  streak, it is usually the cause). Each decoder failure names its phase
+  (`decoder configure` / `decoder submit` / `decoder output`) and the
+  decoder's own account of itself (`HwVideoDecoder::error_context`): on
+  MediaCodec the concrete codec (`c2.amlogic.hevc.decoder`), the picture,
+  direct or image-reader mode, the frame it got to, how many direct codecs
+  of this process were open, and how long configure waited for the
+  previous codec to release the video Surface (`(forced)` = it never did).
+  A pipeline where both the download and the decoder failed reports both
+  (`… (decoder also failed: …)`) instead of dropping the decoder half.
+  The detail can still contain URLs from download errors; hosts that log
+  it remotely should scrub it.
+
 ## 0.3.5
 
 ### iOS

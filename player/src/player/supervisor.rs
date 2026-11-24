@@ -123,6 +123,10 @@ pub(super) async fn video_supervisor(
     let handoff = Arc::new(DecoderHandoff::new());
     let mut retry_attempt: u32 = 0;
     let mut last_fail_pos_ms: u64 = 0;
+    // Every failure of the current streak, so the error that finally
+    // reaches the host tells the whole story (the first failure is often the
+    // cause, the last one only its echo through the retries).
+    let mut failures = FailureLog::default();
     let spawn_pipeline = |repr: VideoRepresenation,
                           start_index: usize,
                           local_stop: Arc<Notify>,
@@ -248,6 +252,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                     let pos_now = position_ms.load(Ordering::Relaxed);
                     if pos_now.saturating_sub(last_fail_pos_ms) > PROGRESS_RESET_MS {
                         retry_attempt = 0;
+                        failures.clear();
                     }
                     last_fail_pos_ms = pos_now;
                     // A codec configured just as the host's Surface went away
@@ -261,6 +266,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                         retry_attempt += 1;
                     }
                     stats.pipeline_retries.fetch_add(1, Ordering::Relaxed);
+                    failures.push(pos_now, surface_lost, &detail);
                     let licence_refused = detail.starts_with(net_io::LICENSE_ERROR_PREFIX);
                     if licence_refused || retry_attempt > MAX_PIPELINE_RETRIES {
                         if licence_refused {
@@ -280,7 +286,7 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                             Some(Duration::from_millis(pos_now));
                         let _ = events.send(PlayerEvent::Error {
                             kind: net_io::pipeline_error_kind(&detail),
-                            detail,
+                            detail: failures.summarize(&detail, &stats),
                         });
                         signal_stop(&stop_flag, &stop);
                         return Err("video pipeline retries exhausted".into());
@@ -543,9 +549,10 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
                 );
                 stats.debug.log("pipeline", format!("failed during an ABR prefetch: {detail}"));
                 *pending_resume.lock().unwrap() = Some(Duration::from_millis(pos_now));
+                failures.push(pos_now, false, &detail);
                 let _ = events.send(PlayerEvent::Error {
                     kind: net_io::pipeline_error_kind(&detail),
-                    detail,
+                    detail: failures.summarize(&format!("during an ABR switch: {detail}"), &stats),
                 });
                 signal_stop(&stop_flag, &stop);
                 return Err("video pipeline failed during an ABR prefetch".into());
@@ -963,3 +970,80 @@ const PREPARE_READY_BUDGET: Duration = Duration::from_millis(5_000);
     }
 }
 
+
+/// The failures of one retry streak, for the error the host finally gets.
+///
+/// The supervisor used to report only the last failure. With retries that is
+/// usually the least telling one: the first failure (a codec that would not
+/// configure because another one still held the hardware, a decode error at
+/// a given frame) is the cause, and the next ones are the rebuilt pipeline
+/// tripping over the same thing.
+#[derive(Default)]
+struct FailureLog {
+    entries: Vec<(u64, bool, String)>,
+}
+
+impl FailureLog {
+    /// Earlier failures are cut to this; the final one is kept whole.
+    const EARLIER_MAX_CHARS: usize = 240;
+    const MAX_ENTRIES: usize = 8;
+
+    fn push(&mut self, pos_ms: u64, surface_lost: bool, detail: &str) {
+        if self.entries.len() >= Self::MAX_ENTRIES {
+            self.entries.remove(1); // keep the first: it is the likely cause
+        }
+        self.entries.push((pos_ms, surface_lost, detail.to_string()));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// `last` first (it is what the error kind was derived from), then the
+    /// streak and the engine's counters at the moment it gave up.
+    fn summarize(&self, last: &str, stats: &StatsState) -> String {
+        let mut out = String::from(last);
+        let earlier = &self.entries[..self.entries.len().saturating_sub(1)];
+        out.push_str(&format!(
+            " | gave up after {} failure(s); decoded {} dropped {} frames; decoder {:?}",
+            self.entries.len().max(1),
+            stats.video_frames_decoded.load(Ordering::Relaxed),
+            stats.video_frames_dropped.load(Ordering::Relaxed),
+            stats.decoder_name.lock().map(|n| n.clone()).unwrap_or_default(),
+        ));
+        for (i, (pos_ms, surface_lost, detail)) in earlier.iter().enumerate() {
+            let short: String = detail.chars().take(Self::EARLIER_MAX_CHARS).collect();
+            let cut = if short.len() < detail.len() { "…" } else { "" };
+            let lost = if *surface_lost { " (surface gone)" } else { "" };
+            out.push_str(&format!(" | #{} at {}s{}: {}{}", i + 1, pos_ms / 1000, lost, short, cut));
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod failure_log_tests {
+    use super::FailureLog;
+
+    #[test]
+    fn keeps_the_first_failure_when_the_streak_is_long() {
+        let mut log = FailureLog::default();
+        for i in 0..20 {
+            log.push(i * 1000, false, &format!("fail {i}"));
+        }
+        assert_eq!(log.entries.len(), FailureLog::MAX_ENTRIES);
+        assert_eq!(log.entries[0].2, "fail 0");
+        assert_eq!(log.entries.last().unwrap().2, "fail 19");
+    }
+
+    #[test]
+    fn summary_leads_with_the_last_error_and_lists_the_earlier_ones() {
+        let mut log = FailureLog::default();
+        log.push(12_000, false, "decoder configure (MediaCodec, c2.x.hevc): AMEDIA_ERROR_UNKNOWN");
+        log.push(12_000, true, "decoder output (MediaCodec): -10000");
+        let s = log.summarize("decoder output (MediaCodec): -10000", &super::StatsState::default());
+        assert!(s.starts_with("decoder output (MediaCodec): -10000 | gave up after 2 failure(s)"), "{s}");
+        assert!(s.contains("#1 at 12s: decoder configure (MediaCodec, c2.x.hevc)"), "{s}");
+        assert!(!s.contains("#2"), "{s}");
+    }
+}

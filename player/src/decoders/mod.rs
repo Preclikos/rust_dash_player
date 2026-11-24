@@ -430,6 +430,14 @@ pub trait HwVideoDecoder: Send {
         "unknown"
     }
 
+    /// What the decoder was when an error left it, appended to that error
+    /// (the host's crash report gets it as the error detail): the concrete
+    /// codec, the picture, how far it got, and whatever resource it had to
+    /// fight for. Empty = nothing beyond [`name`](Self::name).
+    fn error_context(&self) -> String {
+        String::new()
+    }
+
     /// Install codec parameters. Called once before the first `submit`.
     fn configure(&mut self, params: VideoDecoderParams) -> Result<(), DecoderError>;
 

@@ -89,7 +89,21 @@ pub struct MediaCodecDecoder {
     pending_csd: Option<Vec<u8>>,
     /// A sample has already been cut to the input buffer (warned once per codec).
     truncation_warned: bool,
+    /// For [`HwVideoDecoder::error_context`]: the concrete codec
+    /// (`c2.amlogic.hevc.decoder`, or the mime before one was created), the
+    /// picture it was configured for, and how long configure waited for the
+    /// previous direct codec to let go of the video Surface (`forced` = it
+    /// never did and we configured anyway).
+    codec_label: String,
+    configured_size: (u32, u32),
+    surface_wait_ms: u32,
+    surface_forced: bool,
 }
+
+/// Direct codecs of this process alive right now (created, not yet
+/// `AMediaCodec_delete`d). More than one at a decoder error means our own
+/// previous pipeline still held the hardware when the new one started.
+static OPEN_DIRECT_CODECS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // ---------------------------------------------------------------------------
 // Direct mode: MediaCodec renders straight into the host's video Surface.
@@ -616,6 +630,7 @@ impl Drop for SharedDirectCodec {
         // Last reference (decoder + every in-flight frame) gone.
         unsafe {
             ndk_sys::AMediaCodec_delete(self.raw);
+            OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             let w = self.window.load(std::sync::atomic::Ordering::Acquire);
             if !w.is_null() {
                 ndk_sys::ANativeWindow_release(w);
@@ -703,6 +718,10 @@ impl MediaCodecDecoder {
             dovi_profile: None,
             pending_csd: None,
             truncation_warned: false,
+            codec_label: String::new(),
+            configured_size: (0, 0),
+            surface_wait_ms: 0,
+            surface_forced: false,
         }
     }
 
@@ -911,6 +930,8 @@ impl MediaCodecDecoder {
                 )
                 .into());
             }
+            OPEN_DIRECT_CODECS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.codec_label = Self::codec_name(codec).unwrap_or_else(|| mime.to_string());
 
             // In-place ABR switches: configure for the ladder's largest
             // picture where the codec can change resolution in place
@@ -999,11 +1020,13 @@ impl MediaCodecDecoder {
                             "[mc-direct] prior codec still owns the Surface after ~1s; configuring anyway"
                         );
                         DIRECT_WINDOW_BUSY.store(true, Ordering::Release);
+                        self.surface_forced = true;
                         break;
                     }
                     waited += 1;
                     std::thread::sleep(Duration::from_millis(2));
                 }
+                self.surface_wait_ms = waited * 2;
             }
 
             let st = ndk_sys::AMediaCodec_configure(
@@ -1016,6 +1039,7 @@ impl MediaCodecDecoder {
             ndk_sys::AMediaFormat_delete(format);
             if st != ndk_sys::media_status_t::AMEDIA_OK {
                 ndk_sys::AMediaCodec_delete(codec);
+                OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 // No SharedDirectCodec will be created to release the gate.
                 DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("AMediaCodec_configure(direct): {:?}", st).into());
@@ -1023,6 +1047,7 @@ impl MediaCodecDecoder {
             let st = ndk_sys::AMediaCodec_start(codec);
             if st != ndk_sys::media_status_t::AMEDIA_OK {
                 ndk_sys::AMediaCodec_delete(codec);
+                OPEN_DIRECT_CODECS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                 DIRECT_WINDOW_BUSY.store(false, std::sync::atomic::Ordering::Release);
                 return Err(format!("AMediaCodec_start(direct): {:?}", st).into());
             }
@@ -1286,6 +1311,30 @@ impl HwVideoDecoder for MediaCodecDecoder {
         "MediaCodec"
     }
 
+    fn error_context(&self) -> String {
+        let (w, h) = self.configured_size;
+        let mut s = format!(
+            "{} {}x{} {}, frame {}",
+            self.codec_label,
+            w,
+            h,
+            if self.direct_window != 0 { "direct" } else { "image-reader" },
+            self.decoded_frame_idx,
+        );
+        if self.direct_window != 0 {
+            let open = OPEN_DIRECT_CODECS.load(std::sync::atomic::Ordering::Acquire);
+            s.push_str(&format!(", open direct codecs {open}"));
+            if self.surface_wait_ms > 0 || self.surface_forced {
+                s.push_str(&format!(
+                    ", surface wait {}ms{}",
+                    self.surface_wait_ms,
+                    if self.surface_forced { " (forced)" } else { "" }
+                ));
+            }
+        }
+        s
+    }
+
     /// Keep the codec across an ABR switch (direct mode, adaptive playback):
     /// same mime and Dolby Vision profile, same bit depth, transfer and
     /// gamut (a different output format needs a new codec), a picture
@@ -1331,6 +1380,7 @@ impl HwVideoDecoder for MediaCodecDecoder {
             csd.extend_from_slice(n);
         }
         self.pending_csd = Some(csd);
+        self.configured_size = (params.width, params.height);
         self.width = params.width;
         self.height = params.height;
         self.color = params.color;
@@ -1348,6 +1398,10 @@ impl HwVideoDecoder for MediaCodecDecoder {
         // Surface (HW plane carries HDR/HDR10+/DV to the display) — no
         // ImageReader, no GL involvement for video pixels.
         self.direct_window = params.direct_window;
+        self.codec_label = mime.to_string();
+        self.configured_size = (params.width, params.height);
+        self.surface_wait_ms = 0;
+        self.surface_forced = false;
         if self.direct_window != 0 {
             self.width = params.width;
             self.height = params.height;

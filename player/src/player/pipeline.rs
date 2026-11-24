@@ -515,7 +515,11 @@ pub(super) async fn run_decode(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut decoder = match decoder {
         DecoderSource::New(mut decoder) => {
-            decoder.configure(video_decoder_params(&pf, &direct_window, &hdr_decode_8bit, ladder_max))?;
+            if let Err(e) =
+                decoder.configure(video_decoder_params(&pf, &direct_window, &hdr_decode_8bit, ladder_max))
+            {
+                return Err(super::decode::decoder_error(&*decoder, "decoder configure", e));
+            }
             decoder
         }
         DecoderSource::Reconfigured(decoder) => decoder,
@@ -544,12 +548,15 @@ pub(super) async fn run_decode(
     // Propagate failures so the supervisor's bounded retry actually fires —
     // logging alone turned real download/decode deaths into "natural EOF".
     // Download first: a decoder error is usually just the consequence of the
-    // feed dying.
+    // feed dying. Both are kept, though — when it is the other way round the
+    // decoder's half is the only clue. (The download error stays in front:
+    // the supervisor keys a refused licence on its prefix.)
     let dl_err = flatten_task_result("video download_task", dl_res);
     let dec_err = flatten_task_result("video decoder_task", dec_res);
-    match dl_err.or(dec_err) {
-        Some(e) => Err(e),
-        None => Ok(()),
+    match (dl_err, dec_err) {
+        (Some(dl), Some(dec)) => Err(format!("{dl} (decoder also failed: {dec})").into()),
+        (Some(e), None) | (None, Some(e)) => Err(e),
+        (None, None) => Ok(()),
     }
 }
 

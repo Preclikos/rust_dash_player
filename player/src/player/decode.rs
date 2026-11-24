@@ -334,6 +334,22 @@ macro_rules! breathe {
     }};
 }
 
+/// `e` from `op` on `decoder`, with the decoder's own account of itself
+/// ([`HwVideoDecoder::error_context`]) so the error that reaches the host
+/// says which codec, at what picture, after how many frames.
+pub(super) fn decoder_error(
+    decoder: &dyn HwVideoDecoder,
+    op: &str,
+    e: Box<dyn Error + Send + Sync>,
+) -> Box<dyn Error + Send + Sync> {
+    let ctx = decoder.error_context();
+    if ctx.is_empty() {
+        format!("{op} ({}): {e}", decoder.name()).into()
+    } else {
+        format!("{op} ({}, {ctx}): {e}", decoder.name()).into()
+    }
+}
+
 pub(super) async fn video_decoder_task(
     mut receiver: Receiver<DataSegment>,
     sender: Sender<DecodedVideoFrame>,
@@ -555,7 +571,9 @@ pub(super) async fn video_decoder_task(
 
             {
                 let _p = crate::prof::Timer::new(&crate::prof::VIDEO_SUBMIT);
-                decoder.submit(sample_data, pts_us)?;
+                if let Err(e) = decoder.submit(sample_data, pts_us) {
+                    return Err(decoder_error(&**decoder, "decoder submit", e));
+                }
             }
             breathe!(decoder, stop_flag);
         }
@@ -636,7 +654,11 @@ pub(super) async fn drain_video_decoder(
 ) -> Result<bool, Box<dyn Error + Send + Sync>> {
     let _p = crate::prof::Timer::new(&crate::prof::VIDEO_DRAIN);
     loop {
-        match decoder.try_recv()? {
+        let received = match decoder.try_recv() {
+            Ok(r) => r,
+            Err(e) => return Err(decoder_error(&**decoder, "decoder output", e)),
+        };
+        match received {
             Some(frame) => {
                 // Track the high-water-mark of decoded PTS so av_sync can
                 // publish `buffered_ahead_secs` (reorder-buffered frames are
