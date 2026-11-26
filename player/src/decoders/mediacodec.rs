@@ -98,6 +98,9 @@ pub struct MediaCodecDecoder {
     configured_size: (u32, u32),
     surface_wait_ms: u32,
     surface_forced: bool,
+    /// Black frame put on a window a previous codec rendered into: its
+    /// duration, or why it failed. None when not needed.
+    window_clear: Option<Result<u64, String>>,
     /// The safe handoff (see [`MediaCodecDecoder::configure_direct`]): how
     /// many instances the platform says its decoder for this mime can run
     /// (`None` = unknown), how long configure waited for a previous codec to
@@ -128,18 +131,16 @@ static MAX_INSTANCES: std::sync::Mutex<Vec<(String, Option<(String, i32)>)>> = s
 /// seconds after `AMediaCodec_delete`, in its own process, where none of our
 /// counters see it. A codec created before that configures fine and then
 /// fails its first frame (`dequeueOutputBuffer -10000`), and so does every
-/// retry that comes too soon. Realtek (`OMX.realtek.*`, TCL Google TVs) is
-/// known for it (Jellyfin Android TV #5908, and our own Crashlytics on an
-/// RTD2875P); elsewhere it is learned: a fresh codec that fails before its
-/// first frame shortly after a previous delete.
+/// retry that comes too soon. Learned: a fresh codec that fails before its
+/// first frame shortly after a previous delete. (Realtek was assumed to be
+/// such a device until 0.3.11; its real cause is the used window, see
+/// [`super::window_clear`].)
 static SLOW_RELEASE_LEARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Uptime (ms) of the last direct `AMediaCodec_delete` of this process; 0 = none yet.
 static LAST_DIRECT_DELETE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// How long after a delete a slow-release device gets its next codec. The
-/// Realtek service retries for a few seconds and is forced to let go after
-/// about three.
+/// How long after a delete a slow-release device gets its next codec.
 const SLOW_RELEASE_COOLDOWN_MS: u64 = 4_000;
 
 /// A fresh codec failing before its first frame this soon after a delete
@@ -581,6 +582,7 @@ pub fn retarget_direct_output(window: usize) -> Retarget {
     }
     // Back on a real window: the placeholder has served its purpose.
     codec.placeholder.lock().unwrap_or_else(|e| e.into_inner()).take();
+    mark_rendered(window);
     log::info!("[mc-direct] output moved to the new video window");
     Retarget::Moved
 }
@@ -652,7 +654,11 @@ impl SharedDirectCodec {
             h.max(2),
             ImageFormat::PRIVATE,
             HardwareBufferUsage::GPU_SAMPLED_IMAGE,
-            4,
+            // One image: OMX (ACodec) refuses a surface that holds more
+            // buffers than the screen it planned for ("new surface holds onto
+            // more buffers (5) than planned for (4)" with 4 images). The
+            // listener hands each image back at once anyway.
+            1,
         );
         let mut reader = match reader {
             Ok(r) => r,
@@ -689,12 +695,9 @@ impl SharedDirectCodec {
     /// handles, then stop.
     ///
     /// Stopped while frames of it still sit on the display, an OMX codec
-    /// waits for those buffers to come back; on Realtek the vendor service
-    /// then gives the decoder core up only when its watchdog forces it,
-    /// about 3 s later (Jellyfin Android TV #5908), and the next codec
-    /// fails its first frame meanwhile. ExoPlayer drains a codec to end of
-    /// stream before releasing it for the same reason. The placeholder
-    /// hands every buffer back at once. Best effort: a codec that refuses
+    /// waits for those buffers to come back. ExoPlayer drains a codec to
+    /// end of stream before releasing it for the same reason. The
+    /// placeholder hands every buffer back at once. Best effort: a codec that refuses
     /// the move is stopped where it is, as before.
     fn stop(&self) {
         let t0 = std::time::Instant::now();
@@ -724,6 +727,24 @@ struct Teardown {
 /// next codec's error context reports it, so field reports show whether the
 /// previous decoder was released promptly.
 static LAST_TEARDOWN: std::sync::Mutex<Option<(Teardown, u64)>> = std::sync::Mutex::new(None);
+
+/// Video windows a direct codec has rendered into. An OMX codec configured
+/// on one of them again gets a black frame there first (see
+/// [`super::window_clear`]).
+static RENDERED_WINDOWS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// A direct codec renders into `window` now (configured there, or moved
+/// there after Home).
+fn mark_rendered(window: usize) {
+    let mut w = RENDERED_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
+    if !w.contains(&window) {
+        // A few windows per session; keep the list short anyway.
+        if w.len() >= 8 {
+            w.remove(0);
+        }
+        w.push(window);
+    }
+}
 
 impl Drop for SharedDirectCodec {
     fn drop(&mut self) {
@@ -835,6 +856,7 @@ impl MediaCodecDecoder {
             configured_size: (0, 0),
             surface_wait_ms: 0,
             surface_forced: false,
+            window_clear: None,
             max_instances: None,
             prev_codec_wait_ms: 0,
             retried_alone: false,
@@ -1103,8 +1125,6 @@ impl MediaCodecDecoder {
     /// This device gives decoder cores back late (see [`SLOW_RELEASE_LEARNED`]).
     fn slow_release(&self) -> bool {
         SLOW_RELEASE_LEARNED.load(std::sync::atomic::Ordering::Acquire)
-            || self.decoder_hint.to_ascii_lowercase().starts_with("omx.realtek.")
-            || self.codec_label.to_ascii_lowercase().starts_with("omx.realtek.")
     }
 
     /// Hold off (bounded by the cooldown, abortable by the stop signal) until
@@ -1388,6 +1408,26 @@ impl MediaCodecDecoder {
                 self.surface_wait_ms = waited * 2;
             }
 
+            // An OMX vendor pipeline (Realtek) keeps the window's layer bound
+            // to the decoder whose frame it still shows, and a new decoder
+            // there never starts. Replace that frame with a plain one first.
+            // Codec2 decoders take a used window fine; they skip this.
+            self.window_clear = None;
+            let used = RENDERED_WINDOWS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&self.direct_window);
+            if used && self.codec_label.starts_with("OMX.") {
+                let t0 = std::time::Instant::now();
+                let r = super::window_clear::clear_window(self.direct_window as *mut ndk_sys::ANativeWindow);
+                let us = t0.elapsed().as_micros() as u64;
+                match &r {
+                    Ok(()) => log::info!("[mc-direct] black frame on the used video window ({} us)", us),
+                    Err(e) => log::warn!("[mc-direct] black frame on the used video window failed: {}", e),
+                }
+                self.window_clear = Some(r.map(|()| us));
+            }
+
             let st = ndk_sys::AMediaCodec_configure(
                 codec,
                 format,
@@ -1413,6 +1453,7 @@ impl MediaCodecDecoder {
                 return Err(format!("AMediaCodec_start(direct): {:?}", st).into());
             }
 
+            mark_rendered(self.direct_window);
             let window = self.direct_window as *mut ndk_sys::ANativeWindow;
             ndk_sys::ANativeWindow_acquire(window);
             self.direct = Some(Arc::new(SharedDirectCodec {
@@ -1720,6 +1761,11 @@ impl HwVideoDecoder for MediaCodecDecoder {
                     self.surface_wait_ms,
                     if self.surface_forced { " (forced)" } else { "" }
                 ));
+            }
+            match &self.window_clear {
+                Some(Ok(us)) => s.push_str(&format!(", window cleared {}ms", us / 1000)),
+                Some(Err(e)) => s.push_str(&format!(", window clear failed: {e}")),
+                None => {}
             }
         }
         s

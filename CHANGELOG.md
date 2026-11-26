@@ -3,6 +3,32 @@
 One version line for all platforms (see `docs/RELEASING.md`). Desktop hosts
 pin `desktop-vX.Y.Z`; Android, iOS and web consume the published packages.
 
+## 0.3.11
+
+### Android
+
+- **A new decoder starts on Realtek TVs again.** An OMX vendor pipeline
+  (Realtek DVO, TCL Google TVs) keeps the video window's layer bound to the
+  decoder whose last frame it still shows, and a new decoder on that window
+  never starts (`VideoClient: failed to run decoder`, every
+  `dequeueOutputBuffer` -10000) — at an ABR switch between SDR, HDR10 and
+  Dolby Vision, at a manual quality change, after Home. Before an OMX
+  decoder is configured on a window a previous one rendered into, one black
+  GL frame replaces that frame (`window_clear`); the switch shows ~0.5 s of
+  black there. Codec2 decoders take a used window fine and skip it.
+  Reproduced and verified on a TCL RTD2875P (ABR, Dolby Vision, manual
+  switches, Home, 20-switch stress); no change on a Galaxy S21, a
+  Chromecast with Google TV and a Google TV Streamer.
+- **The 0.3.10 park now works on OMX decoders.** The placeholder surface
+  held 4 images, and ACodec refused it ("new surface holds onto more
+  buffers (5) than planned for (4)"); it holds one now.
+- **Realtek no longer waits 4 s before every new decoder.** The 0.3.8
+  "slow release" was a misdiagnosis of the above (a codec's delete takes
+  3-12 ms there); the wait is still learned on a device whose fresh codec
+  fails its first frame.
+- Decoder errors say whether the window was cleared
+  (`window cleared Nms` / `window clear failed: …`).
+
 ## 0.3.10
 
 ### Android

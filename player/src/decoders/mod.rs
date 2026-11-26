@@ -24,6 +24,8 @@ pub mod ffmpeg_hw;
 #[cfg(target_os = "android")]
 pub mod mediacodec;
 #[cfg(target_os = "android")]
+pub mod window_clear;
+#[cfg(target_os = "android")]
 pub mod mediacodec_audio;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
 pub mod videotoolbox;
